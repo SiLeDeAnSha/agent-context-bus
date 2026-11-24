@@ -1,0 +1,85 @@
+{
+  "excel_path": "~/Documents/DailyReport/每日工作汇总.xlsx",
+  "personal_excel_path": "~/Documents/DailyReport/个人技术与折腾汇总.xlsx",
+  "monthly_folders": true,
+  "export_dir": "~/Documents/DailyReport/对外报告",
+  "timezone": "Asia/Shanghai",
+  "day_start_hour": 5,
+  "merge_gap_minutes": 30,
+  "catchup_days": 30,
+  "external_report": {
+    "exclude_keywords": [
+      "VPN",
+      "代理规则",
+      "挖矿代理",
+      "clash",
+      "sing-box",
+      "挖矿",
+      "算力解锁",
+      "越狱",
+      "刷机",
+      "PixelOS",
+      "救砖",
+      "壁纸",
+      "个人情况",
+      "NAS",
+      "闲聊"
+    ],
+    "exclude_categories": [
+      "网络与客户端配置",
+      "刷机与设备维护"
+    ]
+  },
+  "gsheets": {
+    "spreadsheet_id": "",
+    "title": "每日工作汇总"
+  },
+  "scan_dirs": [
+    "~/Desktop",
+    "~/Documents",
+    "~/.gemini/antigravity/scratch"
+  ],
+  "git_search_roots": [
+    "~"
+  ],
+  "exclude_paths": [
+    "~/Documents/DailyReport",
+    "~/.gemini/antigravity/scratch/daily-summary",
+    "~/.codex/memories",
+    "~/.codex/memories_v2",
+    "~/Library",
+    "~/Movies/Videos",
+    "~/Pictures",
+    "~/Music",
+    "~/Applications"
+  ],
+  "exclude_dir_prefixes": [
+    ".cloud_cache"
+  ],
+  "exclude_dir_names": [
+    ".git",
+    "node_modules",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".Trash",
+    ".cache",
+    "Cache",
+    "Caches",
+    ".recycle_bin",
+    "Media Cache",
+    "Media Cache Files",
+    "Peak Files",
+    "Adobe Premiere Pro Auto-Save",
+    "Adobe After Effects Auto-Save",
+    "build",
+    "dist",
+    ".next",
+    ".turbo",
+    ".pytest_cache"
+  ],
+  "self_filter_markers": [
+    "[DAILY-SUMMARY-AUTO]",
+    "The following is the Codex agent history whose request action you are assessing"
+  ]
+}

@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+"""Unit tests for daily-summary collector, 4-sheet Excel writer, catch-up, and external export."""
+
+from compression import zstd
+from datetime import datetime
+import json
+import os
+import tempfile
+import unittest
+from zoneinfo import ZoneInfo
+
+from openpyxl import load_workbook
+
+import collect
+import export_report
+import write_excel
+
+
+class DailySummaryTests(unittest.TestCase):
+    def test_workday_boundary_5am(self) -> None:
+        tz = ZoneInfo("Asia/Shanghai")
+        start, end = collect.workday_bounds("2026-11-21", "Asia/Shanghai", 5)
+        late_night = datetime(2026, 11, 22, 4, 30, tzinfo=tz)
+        next_morning = datetime(2026, 11, 22, 5, 0, tzinfo=tz)
+        self.assertTrue(start <= late_night < end)
+        self.assertFalse(start <= next_morning < end)
+
+    def test_estimate_active_hours_merges_clusters(self) -> None:
+        tz = ZoneInfo("Asia/Shanghai")
+        ts = [
+            datetime(2026, 11, 21, 10, 0, tzinfo=tz),
+            datetime(2026, 11, 21, 10, 20, tzinfo=tz),
+            datetime(2026, 11, 21, 10, 40, tzinfo=tz),
+            datetime(2026, 11, 21, 15, 0, tzinfo=tz),
+        ]
+        self.assertAlmostEqual(collect.estimate_active_hours(ts, 30), 0.85, places=2)
+
+    def test_codex_uuid_extraction_and_zstd(self) -> None:
+        fname = "rollout-2026-11-19T23-58-19-01a1f487-bf3e-7500-a644-9a9a5f0d726e.jsonl.zst"
+        self.assertEqual(collect.extract_codex_uuid(fname), "01a1f487-bf3e-7500-a644-9a9a5f0d726e")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zst_path = os.path.join(tmpdir, fname)
+            with zstd.open(zst_path, "wt", encoding="utf-8") as f:
+                f.write(json.dumps({"type": "response_item"}) + "\n")
+            with zstd.open(zst_path, "rt", encoding="utf-8") as f:
+                self.assertEqual(json.loads(f.readline())["type"], "response_item")
+
+    def test_split_work_and_personal_workbooks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_xlsx = os.path.join(tmpdir, "work.xlsx")
+            personal_xlsx = os.path.join(tmpdir, "personal.xlsx")
+            day1 = {
+                "workday": "2026-11-19",
+                "weekday": "周四",
+                "work_items": [
+                    {
+                        "scope": "work",
+                        "project": "小雪节气海报",
+                        "category": "设计与排版",
+                        "tool": "Antigravity",
+                        "session_name": "Poster Chat",
+                        "summary": "在 /Users/demo/project 优化海报",
+                        "outputs": "海报.psd",
+                        "status": "已完成",
+                        "next_step": "-",
+                        "active_span": "10:00-11:00",
+                        "estimated_hours": 1.0,
+                    },
+                    {
+                        "scope": "personal",
+                        "project": "ComfyUI 管线",
+                        "category": "AI工作流",
+                        "tool": "Codex",
+                        "session_name": "评审工作流",
+                        "summary": "盲测评审",
+                        "outputs": "eval.md",
+                        "status": "进行中",
+                        "next_step": "待真机验收",
+                        "active_span": "22:30-23:00",
+                        "estimated_hours": 0.5,
+                    },
+                ],
+                "life_items": [
+                    {
+                        "tool": "Antigravity",
+                        "session_name": "Chat A",
+                        "topic": "闲聊A",
+                        "summary": "聊了午饭",
+                        "active_span": "12:10",
+                    }
+                ],
+            }
+            day2 = {
+                "workday": "2026-11-21",
+                "weekday": "周六",
+                "work_items": [
+                    {
+                        "scope": "personal",
+                        "project": "VPN代理规则",
+                        "category": "网络与客户端配置",
+                        "tool": "Antigravity",
+                        "session_name": "VPN配置",
+                        "summary": "调整 clash 代理规则",
+                        "outputs": "conf",
+                        "status": "已完成",
+                        "next_step": "-",
+                        "active_span": "10:40-11:00",
+                        "estimated_hours": 0.3,
+                    }
+                ],
+                "life_items": [],
+            }
+
+            res = write_excel.update_split_workbooks([day1, day2], work_xlsx, personal_xlsx)
+            self.assertEqual(res["work"], {"overview_rows": 2, "project_rows": 1, "detail_rows": 1})
+            self.assertEqual(res["personal"], {"overview_rows": 2, "project_rows": 2, "detail_rows": 2, "life_rows": 1})
+
+            missing = collect.find_missing_workdays({"excel_path": work_xlsx}, "2026-11-21", 4)
+            self.assertEqual(missing, ["2026-11-20"])
+
+            wb_w = load_workbook(work_xlsx, data_only=True)
+            self.assertEqual(wb_w.sheetnames, ["每日概览", "项目总览", "项目流程明细"])
+            r0 = write_excel.DATA_START_ROW
+            self.assertEqual(wb_w[write_excel.SHEET_OVERVIEW].cell(row=r0, column=3).value, "无正式工作记录")
+            self.assertEqual(wb_w[write_excel.SHEET_OVERVIEW].cell(row=r0 + 1, column=3).value, "小雪节气海报")
+            wb_w.close()
+
+            wb_p = load_workbook(personal_xlsx, data_only=True)
+            self.assertEqual(wb_p.sheetnames, ["每日概览", "项目总览", "项目流程明细", "生活与随想记录"])
+            self.assertEqual(wb_p[write_excel.SHEET_PROJECTS].cell(row=r0, column=1).value, "VPN代理规则")
+            wb_p.close()
+
+            cfg = collect.load_config()
+            md = export_report.generate_report(work_xlsx, "2026-11-19", "2026-11-21", cfg)
+            self.assertIn("小雪节气海报", md)
+            self.assertNotIn("ComfyUI", md)
+            self.assertNotIn("VPN", md)
+            self.assertNotIn("/Users/demo", md)
+
+    def test_monthly_folder_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_xlsx = os.path.join(tmpdir, "每日工作汇总.xlsx")
+            personal_xlsx = os.path.join(tmpdir, "个人技术与折腾汇总.xlsx")
+            days = [
+                {
+                    "workday": "2026-06-21",
+                    "weekday": "周日",
+                    "work_items": [
+                        {
+                            "scope": "personal",
+                            "project": "PRL 监控",
+                            "category": "自动化",
+                            "tool": "Codex",
+                            "session_name": "PRL晨报",
+                            "summary": "配置监控",
+                            "outputs": "-",
+                            "status": "已完成",
+                            "next_step": "-",
+                            "active_span": "14:00",
+                            "estimated_hours": 0.3,
+                        }
+                    ],
+                    "life_items": [],
+                },
+                {
+                    "workday": "2026-10-18",
+                    "weekday": "周日",
+                    "work_items": [
+                        {
+                            "scope": "work",
+                            "project": "重阳海报",
+                            "category": "设计",
+                            "tool": "Codex",
+                            "session_name": "重阳海报调整",
+                            "summary": "定稿海报",
+                            "outputs": "重阳.psd",
+                            "status": "已完成",
+                            "next_step": "-",
+                            "active_span": "10:00",
+                            "estimated_hours": 1.0,
+                        }
+                    ],
+                    "life_items": [],
+                },
+                {
+                    "workday": "2026-11-18",
+                    "weekday": "周三",
+                    "work_items": [
+                        {
+                            "scope": "work",
+                            "project": "小雪海报",
+                            "category": "设计",
+                            "tool": "Codex",
+                            "session_name": "海报调整",
+                            "summary": "定稿海报",
+                            "outputs": "海报.psd",
+                            "status": "已完成",
+                            "next_step": "-",
+                            "active_span": "10:00",
+                            "estimated_hours": 1.0,
+                        }
+                    ],
+                    "life_items": [
+                        {
+                            "tool": "Antigravity",
+                            "session_name": "闲聊",
+                            "topic": "休息",
+                            "summary": "聊了天气",
+                            "active_span": "12:00",
+                        }
+                    ],
+                },
+            ]
+            res = write_excel.update_split_workbooks(days, work_xlsx, personal_xlsx, split_months=True)
+            self.assertIn("months", res)
+            self.assertFalse(os.path.exists(os.path.join(tmpdir, "2026-06", "每日工作汇总_2026-06.xlsx")))
+            self.assertTrue(os.path.exists(os.path.join(tmpdir, "2026-06", "个人技术与折腾汇总_2026-06.xlsx")))
+            self.assertTrue(os.path.exists(os.path.join(tmpdir, "2026-10", "每日工作汇总_2026-10.xlsx")))
+            self.assertFalse(os.path.exists(os.path.join(tmpdir, "2026-10", "个人技术与折腾汇总_2026-10.xlsx")))
+            self.assertTrue(os.path.exists(os.path.join(tmpdir, "2026-11", "每日工作汇总_2026-11.xlsx")))
+            self.assertTrue(os.path.exists(os.path.join(tmpdir, "2026-11", "个人技术与折腾汇总_2026-11.xlsx")))
+
+
+    def test_compress_turn_history_and_side_span(self) -> None:
+        prompts = [f"第{i}轮任务需求说明" for i in range(1, 31)] + ["继续", "好的"]
+        compressed = collect.compress_turn_history(prompts)
+        self.assertIn("第28轮任务需求说明", compressed)
+        self.assertNotIn("继续", compressed)
+        self.assertTrue(write_excel.span_sort_key("14:00-15:00") < write_excel.span_sort_key("含于主会话"))
+
+    def test_codex_sessions_precede_archived_and_json_index_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            s_dir = os.path.join(tmpdir, "sessions", "2026", "11")
+            a_dir = os.path.join(tmpdir, "archived_sessions")
+            os.makedirs(s_dir, exist_ok=True)
+            os.makedirs(a_dir, exist_ok=True)
+            s_file = os.path.join(s_dir, "rollout-1.jsonl")
+            a_file = os.path.join(a_dir, "rollout-1.jsonl")
+            open(s_file, "w").close()
+            open(a_file, "w").close()
+            ordered = collect.list_codex_rollout_paths([os.path.join(tmpdir, "sessions"), a_dir])
+            self.assertEqual(ordered, [s_file, a_file])
+
+            data_dir = os.path.join(tmpdir, "data")
+            res1 = write_excel.sync_json_indexes([{"workday": "2026-11-21", "work_items": [], "life_items": []}], data_dir=data_dir)
+            self.assertEqual(res1, {"total_days": 1, "updated_months": 1})
+            res2 = write_excel.sync_json_indexes([{"workday": "2026-11-22", "work_items": [], "life_items": []}], data_dir=data_dir)
+            self.assertEqual(res2, {"total_days": 2, "updated_months": 1})
+            with open(os.path.join(data_dir, "summary_all_history.json"), "r", encoding="utf-8") as f:
+                self.assertEqual([d["workday"] for d in json.load(f)["days"]], ["2026-11-21", "2026-11-22"])
+
+    def test_workbuddy_column_and_parser(self) -> None:
+        self.assertEqual(collect.clean_workbuddy_user_text('<system-reminder data-role="x">secret</system-reminder> 你好帮我看下 '), "你好帮我看下")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_xlsx = os.path.join(tmpdir, "work.xlsx")
+            personal_xlsx = os.path.join(tmpdir, "personal.xlsx")
+            day = {
+                "workday": "2026-11-23",
+                "weekday": "周一",
+                "work_items": [
+                    {
+                        "scope": "personal",
+                        "project": "KPL抢票",
+                        "category": "自动化",
+                        "tool": "WorkBuddy",
+                        "session_name": "编写KPL抢票脚本 [目录: project]",
+                        "summary": "编写脚本",
+                        "outputs": "kpl.py",
+                        "status": "已完成",
+                        "next_step": "-",
+                        "active_span": "12:22-12:40",
+                        "estimated_hours": 0.4,
+                    }
+                ],
+                "life_items": [],
+            }
+            res = write_excel.update_split_workbooks([day], work_xlsx, personal_xlsx)
+            self.assertEqual(res["personal"]["project_rows"], 1)
+            wb = load_workbook(personal_xlsx, data_only=True)
+            ws_ov = wb[write_excel.SHEET_OVERVIEW]
+            self.assertEqual(ws_ov.cell(row=write_excel.HEADER_ROW, column=6).value, "WorkBuddy 干了啥")
+            self.assertEqual(ws_ov.cell(row=write_excel.DATA_START_ROW, column=6).value, "编写脚本")
+            ws_p = wb[write_excel.SHEET_PROJECTS]
+            self.assertEqual(ws_p.cell(row=write_excel.HEADER_ROW, column=14).value, "WB 跨度(h)")
+            self.assertAlmostEqual(float(ws_p.cell(row=write_excel.DATA_START_ROW, column=14).value), 0.4, places=2)
+            wb.close()
+
+    def test_t3_code_collector_filtering_and_dedup(self) -> None:
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "statev2.sqlite")
+            conn = sqlite3.connect(db_path)
+            conn.executescript(
+                """
+                CREATE TABLE projection_projects (
+                    project_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    workspace_root TEXT NOT NULL
+                );
+                CREATE TABLE orchestration_v2_projection_threads (
+                    thread_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    default_provider TEXT NOT NULL,
+                    provider_instance_id TEXT,
+                    archived_at TEXT,
+                    deleted_at TEXT,
+                    payload_json TEXT NOT NULL
+                );
+                CREATE TABLE orchestration_v2_projection_provider_threads (
+                    provider_thread_id TEXT PRIMARY KEY,
+                    thread_id TEXT,
+                    provider TEXT NOT NULL,
+                    provider_session_id TEXT
+                );
+                CREATE TABLE orchestration_v2_projection_messages (
+                    message_id TEXT PRIMARY KEY,
+                    thread_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    payload_json TEXT NOT NULL
+                );
+                """
+            )
+            conn.execute("INSERT INTO projection_projects VALUES ('p1', 't3code', '/Users/demo/Desktop/t3code')")
+            conn.executemany(
+                "INSERT INTO orchestration_v2_projection_threads VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    ("t_ag", "p1", "日报自动化", "antigravity", "antigravity", None, None, json.dumps({"lineage": {}})),
+                    ("t_cb", "p1", "打招呼", "acpRegistry_codebuddy_code", "acpRegistry_codebuddy_code", None, None, json.dumps({"lineage": {}})),
+                    ("t_cl", "p1", "Claude调研", "claudeAgent", "claudeAgent", None, None, json.dumps({"lineage": {}})),
+                    ("t_cx_dup", "p1", "Codex已采集", "codex", "codex", None, None, json.dumps({"lineage": {}})),
+                    ("thread:subagent:1", "p1", "Sub Worker", "antigravity", "antigravity", None, None, json.dumps({"lineage": {"relationshipToParent": "subagent"}})),
+                    ("t_handoff_only", "p1", "仅交接未发言", "antigravity", "antigravity", None, None, json.dumps({"lineage": {}})),
+                    ("t_auto", "p1", "每日工作汇总", "antigravity", "antigravity", None, None, json.dumps({"lineage": {}})),
+                ],
+            )
+            conn.execute("INSERT INTO orchestration_v2_projection_provider_threads VALUES ('pt1', 't_cx_dup', 'codex', 'cx-uuid-1')")
+            conn.executemany(
+                "INSERT INTO orchestration_v2_projection_messages VALUES (?, ?, ?, ?, ?)",
+                [
+                    ("m1", "t_ag", "user", "2026-11-24T03:07:26Z", json.dumps({"createdBy": "agent", "creationSource": "mcp", "text": "交接上下文"})),
+                    ("m2", "t_ag", "user", "2026-11-24T03:12:00Z", json.dumps({"createdBy": "user", "creationSource": "web", "text": "把自动化搬到 T3 Code 上跑"})),
+                    ("m3", "t_ag", "assistant", "2026-11-24T03:13:00Z", json.dumps({"createdBy": "agent", "creationSource": "provider", "text": "已完成 T3 适配和定时任务"})),
+                    ("m4", "t_cb", "user", "2026-11-24T02:14:00Z", json.dumps({"createdBy": "user", "creationSource": "web", "text": "哈喽"})),
+                    ("m5", "t_cl", "user", "2026-11-24T04:00:00Z", json.dumps({"createdBy": "user", "creationSource": "web", "text": "分析代码结构"})),
+                    ("m6", "t_cx_dup", "user", "2026-11-24T04:10:00Z", json.dumps({"createdBy": "user", "creationSource": "web", "text": "修个bug"})),
+                    ("m7", "thread:subagent:1", "user", "2026-11-24T04:15:00Z", json.dumps({"createdBy": "user", "creationSource": "web", "text": "子任务"})),
+                    ("m8", "t_handoff_only", "user", "2026-11-24T03:07:30Z", json.dumps({"createdBy": "agent", "creationSource": "mcp", "text": "纯迁移交接"})),
+                    ("m9", "t_auto", "user", "2026-11-24T01:00:00Z", json.dumps({"createdBy": "user", "creationSource": "scheduled", "text": "[DAILY-SUMMARY-AUTO] 执行汇总"})),
+                ],
+            )
+            conn.commit()
+            conn.close()
+
+            tz = ZoneInfo("Asia/Shanghai")
+            start_dt, end_dt = collect.workday_bounds("2026-11-24", "Asia/Shanghai", 5)
+            cfg = {"merge_gap_minutes": 30, "self_filter_markers": ["[DAILY-SUMMARY-AUTO]"]}
+            ag, _, cx, _, wb, _, other, _, hints = collect.collect_t3_code(
+                start_dt, end_dt, tz, "2026-11-24", cfg, existing_codex_ids={"cx-uuid-1"}, db_path=db_path
+            )
+            self.assertEqual(len(ag), 1)
+            self.assertEqual(ag[0]["display_title"], "日报自动化 [T3·t3code]")
+            self.assertEqual(ag[0]["user_prompts"], ["把自动化搬到 T3 Code 上跑"])
+            self.assertEqual(len(wb), 1)
+            self.assertEqual(wb[0]["display_title"], "打招呼 [T3·Codebuddy/t3code]")
+            self.assertEqual(len(other), 1)
+            self.assertEqual(other[0]["source"], "Claude")
+            self.assertEqual(len(cx), 0)
+            self.assertEqual(hints.get("cx-uuid-1"), "Codex已采集 [T3·t3code]")
+
+
+if __name__ == "__main__":
+    unittest.main()

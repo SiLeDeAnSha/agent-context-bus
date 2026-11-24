@@ -1,0 +1,10 @@
+config.json
+data/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.DS_Store
+*.xlsx
+*.log
