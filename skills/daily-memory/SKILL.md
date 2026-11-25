@@ -18,7 +18,7 @@ description: 检索与维护跨端 AI 历史工作与技术记忆库（Antigravi
 
 ## 工作流 A：查历史记忆与跨端接力（默认，只读）
 
-按以下 3 级梯度按需下钻，控制上下文体积：
+按以下顺序按需下钻，控制上下文体积：
 
 1. **L2 现行状态总览（首选，~18 KB）**：
    直接读取 `~/Documents/DailyReport/MEMORY_INDEX.md`，即可看到全部置顶进行中项目、正式工作与个人技术项目最新状态、下一步/卡点及近 7 天主线。
@@ -36,8 +36,12 @@ description: 检索与维护跨端 AI 历史工作与技术记忆库（Antigravi
    # 查看指定日期全天记录
    python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --date YYYY-MM-DD
    ```
-3. **L3 原始溯源（跨端接力找代码/会话时加 `--raw`）**：
-   在 `--project`、`--keyword` 或 `--date` 后追加 `--raw`，可从 `data/raw/<YYYY-MM>/raw_<YYYY-MM-DD>.json` 提取原始会话 UUID、工作区路径（`workspace`/`cwd`）、用户原始指令、里程碑、Git 仓库提交及本地改动文件。需要机器解析时追加 `--json`。
+3. **采集证据与原会话定位**：
+   用 `--raw` 查看会话 ID、工作区、抽样消息与 Git 或文件证据。需要找日报和采集证据里省略的命令、报错原文或对话时，再搜索本机原会话。
+   ```bash
+   python3 ~/.gemini/antigravity/scratch/daily-summary/search_sessions.py --keyword "<命令或报错的一段原文>" --session-id "<会话 ID>"
+   ```
+   会话 ID 未知时可用 `--client antigravity|codex|workbuddy|t3` 及 `--date YYYY-MM-DD` 缩小范围。默认最多返回 5 个命中片段及其出处。只读命中片段即可，普通日报检索仍走前两步。
 
 ---
 

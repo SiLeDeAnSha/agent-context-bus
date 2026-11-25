@@ -2,22 +2,228 @@
 """Unit tests for daily-summary collector, 4-sheet Excel writer, catch-up, and external export."""
 
 from compression import zstd
+from contextlib import redirect_stdout
 from datetime import datetime
+import io
 import json
 import os
+from pathlib import Path
+import re
+import shlex
 import tempfile
 import unittest
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from openpyxl import load_workbook
 
 import collect
 import export_report
+import onboarding
 import query_memory
+import search_sessions
 import write_excel
+from provenance import SOURCE_ARCHIVE_MISSING, verify_day_sources
+from project_identity import ProjectCatalog, edit_registry, load_registry, project_id
 
 
 class DailySummaryTests(unittest.TestCase):
+    def test_first_import_selects_client_and_opens_persisted_project(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            output_dir = root / "wizard imports"
+            session_id = "01234567-89ab-cdef-0123-456789abcdef"
+            rollout = root / ".codex/sessions" / f"rollout-{session_id}.jsonl"
+            rollout.parent.mkdir(parents=True)
+            events = [{"type": "session_meta", "payload": {"id": session_id, "cwd": "/work/old-project"}}]
+            for stamp, text in [
+                ("2026-11-18T20:59:59Z", "outside the window"),
+                ("2026-11-18T21:00:00Z", "recover the project"),
+            ]:
+                events.append({"type": "response_item", "timestamp": stamp, "payload": {
+                    "type": "message", "role": "user", "content": [{"type": "input_text", "text": text}],
+                }})
+            rollout.write_text("\n".join(map(json.dumps, events)) + "\n", encoding="utf-8")
+            mtime = datetime.fromisoformat("2026-11-25T12:00:00+00:00").timestamp()
+            os.utime(rollout, (mtime, mtime))
+
+            ag_log = root / ".gemini/antigravity/brain/other/.system_generated/logs/transcript.jsonl"
+            ag_log.parent.mkdir(parents=True)
+            ag_log.write_text('{"type":"USER_INPUT","created_at":"2026-11-24T06:00:00Z","content":"other"}\n', encoding="utf-8")
+            os.utime(ag_log, (mtime, mtime))
+            cfg = {"timezone": "Asia/Shanghai", "day_start_hour": 5, "merge_gap_minutes": 30}
+            with patch.object(os.path, "expanduser", side_effect=lambda name: str(name).replace("~/", f"{root}/", 1)), \
+                 patch.object(query_memory, "load_config", return_value=cfg), \
+                 patch.object(collect, "current_workday", return_value="2026-11-25"), \
+                 patch("builtins.input", side_effect=["0", "2"]), \
+                 patch.object(collect, "collect_antigravity") as ag_collect, \
+                 patch.object(collect, "collect_git") as git_collect, \
+                 patch.object(collect, "collect_local_files") as file_collect, \
+                 redirect_stdout(io.StringIO()) as stdout:
+                self.assertEqual(onboarding.import_week(output_dir), 0)
+                self.assertFalse(output_dir.exists())
+                self.assertEqual(onboarding.import_week(output_dir), 0)
+                ag_collect.assert_not_called()
+                git_collect.assert_not_called()
+                file_collect.assert_not_called()
+
+            snapshot, = output_dir.iterdir()
+            days = query_memory.load_all_days(snapshot)
+            self.assertEqual([day["workday"] for day in days], ["2026-11-19"])
+            self.assertIn("Antigravity（可读）", stdout.getvalue())
+            self.assertIn("old-project", stdout.getvalue())
+            command = next(line.strip() for line in stdout.getvalue().splitlines() if " query_memory.py " in line)
+            if os.name != "nt":
+                argv = shlex.split(command)
+                self.assertEqual(Path(argv[argv.index("--data-dir") + 1]), snapshot.resolve())
+                self.assertEqual(argv[argv.index("--project") + 1], project_id("old-project"))
+            match = query_memory.query_by_project(days, project_id("old-project"), include_raw=True, data_dir=snapshot)
+            self.assertEqual(match["total_matches"], 1)
+            self.assertEqual(match["entries"][0]["summary"], "recover the project")
+            self.assertEqual(match["entries"][0]["sources"][0]["id"], session_id)
+            self.assertTrue(match["raw"])
+
+    def test_first_import_without_readable_history_does_not_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir) / "empty"
+            with patch.object(os.path, "expanduser", side_effect=lambda name: str(name).replace("~/", f"{tmpdir}/", 1)), \
+                 patch("builtins.input") as prompt, redirect_stdout(io.StringIO()):
+                self.assertEqual(onboarding.import_week(output_dir), 1)
+                prompt.assert_not_called()
+            self.assertFalse(output_dir.exists())
+
+    def test_first_import_keeps_same_named_workspaces_apart_across_days(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            sessions = {
+                "2026-11-23": {"id": "first", "cwd": "/clients/one/backend", "title": "First"},
+                "2026-11-24": {"id": "second", "cwd": "/clients/two/backend", "title": "Second"},
+                "2026-11-25": {"id": "third", "workspace": "file:///clients/one/backend/", "title": "Third"},
+            }
+
+            def build_raw(workday, *_args, **_kwargs):
+                return {"workday": workday, "machine": "mac", "codex": [sessions[workday]] if workday in sessions else []}
+
+            with patch.object(collect, "current_workday", return_value="2026-11-25"), \
+                 patch.object(collect, "build_day_payload", side_effect=build_raw), \
+                 patch.object(onboarding, "choose_clients", return_value={"codex"}), \
+                 patch.object(onboarding, "has_readable_log", return_value=True), \
+                 patch.object(onboarding, "has_readable_t3", return_value=False), \
+                 patch.object(collect, "list_codex_rollout_paths", return_value=[]), \
+                 patch.object(collect, "load_workbuddy_metadata", return_value=({}, {})), \
+                 redirect_stdout(io.StringIO()):
+                self.assertEqual(onboarding.import_week(output_dir), 0)
+
+            snapshot, = output_dir.iterdir()
+            days = query_memory.load_all_days(snapshot)
+            overview = query_memory.query_by_project(days, "backend", data_dir=snapshot)
+            self.assertEqual(len(overview["matched_identities"]), 2)
+            for path, ids in [("/clients/one/backend", {"first", "third"}), ("/clients/two/backend", {"second"})]:
+                identity = next(p for p in overview["matched_identities"] if path in p["project"])
+                result = query_memory.query_by_project(days, identity["project_id"], include_raw=True, data_dir=snapshot)
+                self.assertEqual({s["id"] for day in result["raw"] for s in day["sessions"]}, ids)
+
+    def test_session_search_reads_full_logs_and_returns_bounded_excerpts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            logs = root / ".gemini/antigravity/brain/session-a/.system_generated/logs"
+            logs.mkdir(parents=True)
+            short = logs / "transcript.jsonl"
+            short.write_text('{"type":"USER_INPUT","content":"sampled text"}\n', encoding="utf-8")
+            full = logs / "transcript_full.jsonl"
+            full.write_text(json.dumps({
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-24T18:30:00Z",
+                "tool_calls": [{"args": {"CommandLine": 'ffprobe "clip one.mov"'}}],
+            }) + "\n", encoding="utf-8")
+
+            codex_id = "01234567-89ab-cdef-0123-456789abcdef"
+            rollout = root / f"rollout-{codex_id}.jsonl.zst"
+            output = "x" * 900 + " ValueError: clip one.mov"
+            rollout.write_bytes(zstd.compress(("{incomplete\n" + json.dumps({
+                "type": "response_item",
+                "timestamp": "2026-11-24T04:10:00Z",
+                "payload": {"type": "function_call_output", "output": output},
+            }) + "\n").encode()))
+
+            tz = ZoneInfo("Asia/Shanghai")
+            start, end = collect.workday_bounds("2026-11-24", tz.key, 5)
+            errors = []
+            with patch.object(Path, "home", return_value=root), \
+                 patch.object(search_sessions, "load_antigravity_annotations", return_value=({}, {})), \
+                 patch.object(search_sessions, "list_codex_rollout_paths", return_value=[str(rollout)]):
+                matches = list(search_sessions.find_matches(
+                    ("antigravity", "codex"), {"session-a", codex_id}, re.compile(r"clip one\.mov"),
+                    start, end, tz, 5, errors,
+                ))
+
+            command, error = [hit for _, hit in matches]
+            self.assertEqual(errors, [])
+            self.assertEqual(command["excerpt"], 'ffprobe "clip one.mov"')
+            self.assertEqual(command["path"], str(full))
+            self.assertEqual(command["workday"], "2026-11-24")
+            self.assertEqual(error["kind"], "tool_output")
+            self.assertEqual(error["position"], 2)
+            self.assertTrue(error["excerpt"].endswith("ValueError: clip one.mov"))
+            self.assertLessEqual(len(error["excerpt"]), search_sessions.MAX_EXCERPT + 2)
+
+    def test_project_decisions_update_old_and_future_progress(self) -> None:
+        from summarizer import normalize_summary_schema
+
+        main = "ComfyUI 人像与视频管线"
+        alias = "comfyui-mcp"
+        face = "保脸工作流"
+        main_id = project_id(main)
+        face_id = project_id(face)
+        old = {
+            "workday": "2026-11-21",
+            "work_items": [{"project": main}, {"project": alias}],
+            "project_briefs": {main: {"ag": "人像处理"}, alias: {"codex": "MCP 集成"}},
+        }
+        new = normalize_summary_schema(
+            {"work_items": [
+                {"project": face, "suggested_project_id": main_id, "project_suggestion_reason": "人像工作流"},
+                {"project": "其他", "suggested_project_id": "invented-id"},
+            ]},
+            {"workday": "2026-11-22"},
+            valid_project_ids={main_id},
+        )
+        days = [old, new]
+        with tempfile.TemporaryDirectory() as data_dir:
+            before = ProjectCatalog(days)
+            self.assertEqual(before.for_item(new["work_items"][0])["project_id"], face_id)
+            self.assertEqual([p["label"] for p in before.suggestions(days)], [face])
+            self.assertNotIn("suggested_project_id", new["work_items"][1])
+            merged = edit_registry(data_dir, days, "merge", main, [alias, face])
+            self.assertEqual(merged["project_id"], main_id)
+            self.assertEqual(edit_registry(data_dir, days, "merge", main_id, [alias, face]), merged)
+            for term in (main, main_id, alias, "ＣＯＭＦＹＵＩ－ＭＣＰ", face, face_id):
+                result = query_memory.query_by_project(days, term, data_dir=data_dir)
+                self.assertEqual(result["total_matches"], 3)
+                self.assertEqual([p["project_id"] for p in result["matched_identities"]], [main_id])
+                self.assertEqual(result["entries"][0]["project_label"], face)
+            catalog = ProjectCatalog(days, load_registry(data_dir))
+            self.assertEqual(catalog.suggestions(days), [])
+            self.assertEqual(catalog.briefs(old["project_briefs"]), {main: {"ag": "人像处理", "codex": "MCP 集成"}})
+
+            split = edit_registry(data_dir, days, "split", face_id, [])
+            self.assertEqual(split["project_id"], face_id)
+            self.assertEqual(split["project"], face)
+            self.assertEqual(query_memory.query_by_project(days, main_id, data_dir=data_dir)["total_matches"], 2)
+            self.assertEqual(edit_registry(data_dir, days, "split", face, []), split)
+            future = {"workday": "2026-11-23", "work_items": [{"project": face, "suggested_project_id": main_id}]}
+            write_excel.sync_json_indexes(days + [future], data_dir=data_dir)
+            history = query_memory.load_all_days(data_dir)
+            catalog = ProjectCatalog(history, load_registry(data_dir))
+            self.assertEqual(catalog.suggestions(history), [])
+            self.assertEqual(query_memory.query_by_project(history, face_id, data_dir=data_dir)["total_matches"], 2)
+            self.assertEqual(query_memory.query_by_project(history, main_id, data_dir=data_dir)["total_matches"], 2)
+            self.assertEqual(query_memory.query_keyword(history, alias, data_dir=data_dir)["total_matches"], 2)
+            self.assertEqual(query_memory.query_exact_date(history, old["workday"], data_dir=data_dir)
+                             ["day"]["work_items"][1]["project"], main)
+            self.assertEqual(history[0]["work_items"][1]["project"], alias)
+            self.assertEqual(query_memory.project_candidates(data_dir)[0]["project_id"], face_id)
+
     def test_workday_boundary_5am(self) -> None:
         tz = ZoneInfo("Asia/Shanghai")
         start, end = collect.workday_bounds("2026-11-21", "Asia/Shanghai", 5)
@@ -429,6 +635,12 @@ class DailySummaryTests(unittest.TestCase):
                             "session_name": "检索CLI开发",
                             "summary": "落地新方案 B",
                             "outputs": "query_memory.py",
+                            "sources": [
+                                {"kind": "session", "id": "uuid-mem-123", "bucket": "antigravity",
+                                 "machine": "", "workspace": "~/demo"},
+                                {"kind": "commit", "id": "abc1234", "repo": "~/demo",
+                                 "machine": "", "files": ["query_memory.py"]},
+                            ],
                             "status": "待验证",
                             "next_step": "跑完单测",
                             "active_span": "14:00-16:00",
@@ -460,6 +672,12 @@ class DailySummaryTests(unittest.TestCase):
                                 "workspace": "~/demo",
                                 "user_prompts": ["实现 query_memory.py 并支持 raw 下钻"],
                                 "assistant_milestones": ["完成索引与检索逻辑"],
+                            },
+                            {
+                                "source": "Antigravity",
+                                "id": "unrelated-id",
+                                "display_title": "记忆库改造与 query_memory.py",
+                                "workspace": "~/demo",
                             }
                         ],
                         "git": [
@@ -497,7 +715,16 @@ class DailySummaryTests(unittest.TestCase):
             tl = query_memory.query_project_timeline(days, "记忆库", include_raw=True, data_dir=data_dir)
             self.assertEqual(tl["total_matches"], 2)
             self.assertEqual(tl["entries"][0]["workday"], "2026-11-24")
-            self.assertEqual(tl["raw"][0]["sessions"][0]["id"], "uuid-mem-123")
+            self.assertEqual([s["id"] for s in tl["raw"][0]["sessions"]], ["uuid-mem-123"])
+            self.assertEqual(tl["entries"][1]["source_status"], "来源待核对")
+            self.assertIn("来源待核对", query_memory.format_project_query_md(tl))
+
+            old = query_memory.query_exact_date(days, "2026-11-20", include_raw=True, data_dir=data_dir)
+            self.assertIsNone(old["raw"])
+            self.assertIn("来源待核对", query_memory.format_exact_date_md(old))
+            offline = query_memory.query_project_timeline(days, "记忆库", include_raw=True, data_dir=tmpdir)
+            self.assertEqual(offline["entries"][0]["raw_sources_unavailable"], 2)
+            self.assertIn("uuid-mem-123", query_memory.format_project_query_md(offline))
 
             kw = query_memory.query_keyword(days, "query_memory", include_raw=True, data_dir=data_dir)
             self.assertEqual(kw["total_matches"], 1)
@@ -506,6 +733,94 @@ class DailySummaryTests(unittest.TestCase):
             life_kw = query_memory.query_keyword(days, "Hydrogen", scope="life", data_dir=data_dir)
             self.assertEqual(life_kw["total_matches"], 1)
             self.assertEqual(life_kw["hits"][0]["kind"], "life_item")
+
+    def test_provenance_verifies_sources_and_preserves_them_in_workbook(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "work.xlsx")
+            raw = {
+                "codex": [
+                    {"id": "shared-id", "machine": "mac", "cwd": "/verified/work"},
+                    {"id": "shared-id", "machine": "win", "workspace": "D:\\other"},
+                ],
+                "git": [{
+                    "machine": "mac", "repo": "/verified/work",
+                    "commits": [{"hash": "abc1234", "files": ["main.py"]}],
+                }],
+                "files": [{"machine": "mac", "paths": ["/verified/work/out.md"], "sample_files": ["out.md"]}],
+            }
+            item = {"project": "多端测试", "scope": "work", "summary": "发布报告", "sources": [
+                {"kind": "session", "id": "shared-id"},
+                {"kind": "session", "id": "shared-id", "machine": "mac", "bucket": "codex", "workspace": "/invented"},
+                {"kind": "commit", "id": "abc1234", "repo": "/verified/work", "files": ["invented.py"]},
+                {"kind": "commit", "id": "abc1234", "repo": "/other/repo"},
+                {"kind": "file", "id": "/verified/work/out.md"},
+                {"kind": "file", "id": "out.md"},
+            ]}
+            prior = {"workday": "2026-11-20", "work_items": [{"project": "旧项目", "manual_note": "保留人工备注"}]}
+            write_excel.update_excel([prior], path, include_life=False)
+
+            day = verify_day_sources({"workday": "2026-11-21", "work_items": [item]}, raw)
+            sources = day["work_items"][0]["sources"]
+            self.assertEqual([ref["kind"] for ref in sources], ["session", "commit", "file"])
+            self.assertEqual(sources[0]["workspace"], "/verified/work")
+            self.assertEqual(sources[1]["files"], ["main.py"])
+
+            raw_dir = os.path.join(tmpdir, "raw", "2026-11")
+            os.makedirs(raw_dir)
+            raw["files"][0]["paths"].append("/verified/work/unrelated.md")
+            with open(os.path.join(raw_dir, "raw_2026-11-21.json"), "w", encoding="utf-8") as f:
+                json.dump(raw, f)
+            result = query_memory.query_exact_date([day], "2026-11-21", include_raw=True, data_dir=tmpdir)
+            self.assertEqual(result["raw"]["files"][0]["sample_files"], ["/verified/work/out.md"])
+            self.assertEqual([s["machine"] for s in result["raw"]["sessions"]], ["mac"])
+
+            write_excel.update_excel([day], path, include_life=False)
+            wb = load_workbook(path)
+            sheet = wb["项目流程明细"]
+            self.assertEqual(sheet["N4"].value, "出处")
+            self.assertIn("/verified/work/out.md", sheet["N5"].value)
+            self.assertEqual(sheet["M6"].value, "保留人工备注")
+            self.assertEqual(sheet["N6"].value, "来源待核对")
+            wb.close()
+
+    def test_reimport_preserves_saved_sources_until_raw_can_be_checked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            workday = "2026-11-24"
+            raw = {"codex": [{"id": "session-one", "machine": "mac", "cwd": "/known/work"}]}
+            day = verify_day_sources({"workday": workday, "work_items": [{
+                "project": "backend", "scope": "work", "summary": "Updated the project",
+                "sources": [{"kind": "session", "id": "session-one"}],
+            }]}, raw)
+            source = root / "backed-up-summary.json"
+            source.write_text(json.dumps(day), encoding="utf-8")
+            config = {"excel_path": str(root / "work.xlsx"), "personal_excel_path": str(root / "personal.xlsx")}
+            args = ["write_excel.py", "--input", str(source), "--data-dir", str(root), "--no-monthly", "--no-memory-index"]
+
+            def reimport():
+                with patch.object(write_excel, "load_config", return_value=config), \
+                     patch("sys.argv", args), redirect_stdout(io.StringIO()):
+                    write_excel.main()
+                return query_memory.load_all_days(root)
+
+            history = reimport()
+            result = query_memory.query_by_project(history, "backend", include_raw=True, data_dir=root)
+            self.assertEqual(result["entries"][0]["sources"], day["work_items"][0]["sources"])
+            self.assertEqual(result["entries"][0]["source_status"], SOURCE_ARCHIVE_MISSING)
+            self.assertEqual(result["entries"][0]["raw_sources_unavailable"], 1)
+            workbook = load_workbook(config["excel_path"])
+            self.assertIn(SOURCE_ARCHIVE_MISSING, workbook["项目流程明细"]["N5"].value)
+            workbook.close()
+
+            raw_file = root / "raw" / "2026-11" / f"raw_{workday}.json"
+            raw_file.parent.mkdir(parents=True)
+            raw_file.write_text(json.dumps(raw), encoding="utf-8")
+            resolved = query_memory.query_by_project(history, "backend", include_raw=True, data_dir=root)
+            self.assertEqual(resolved["entries"][0]["source_status"], "已记录")
+            self.assertEqual(resolved["raw"][0]["sessions"][0]["id"], "session-one")
+
+            raw_file.write_text("{}", encoding="utf-8")
+            self.assertEqual(reimport()[0]["work_items"][0]["sources"], [])
 
     def test_sync_global_rules_idempotency_and_preservation(self) -> None:
         import importlib.util
@@ -724,6 +1039,18 @@ class NasHubAndMultiMachineTests(unittest.TestCase):
                 self.assertIn("ag-win-1", win_only_md)
                 self.assertNotIn("ag-mac-1", win_only_md)
 
+                project = {"action": "merge", "target": "gpu-broker", "labels": ["推理调度器"]}
+                with self.assertRaises(remote_client.RemoteAuthError):
+                    remote_client.request_json(
+                        ro_rc, "POST", "/api/v1/project-review", json_body=project, write=True,
+                    )
+                edited, _ = remote_client.request_json(
+                    rw_rc, "POST", "/api/v1/project-review", json_body=project, write=True,
+                )
+                self.assertEqual(edited["project"]["aliases"], ["推理调度器"])
+                review, _ = remote_client.request_json(ro_rc, "GET", "/api/v1/project-review")
+                self.assertEqual(review["suggestions"], [])
+
                 sync_info = remote_client.sync_local_cache(ro_rc)
                 self.assertEqual(sync_info["total_days"], 1)
                 self.assertTrue(os.path.exists(sync_info["index_path"]))
@@ -757,7 +1084,7 @@ class NasHubAndMultiMachineTests(unittest.TestCase):
                         "jsonrpc": "2.0",
                         "id": 3,
                         "method": "tools/call",
-                        "params": {"name": "memory_query", "arguments": {"project": "gpu-broker", "machine": "macbook", "raw": True}},
+                        "params": {"name": "memory_query", "arguments": {"project": "推理调度器", "machine": "macbook", "raw": True}},
                     },
                     write=False,
                 )
@@ -787,7 +1114,7 @@ class NasHubAndMultiMachineTests(unittest.TestCase):
                     "--remote-config",
                     remote_cfg_path,
                     "--project",
-                    "gpu-broker",
+                    "推理调度器",
                 ],
                 capture_output=True,
                 text=True,
@@ -817,6 +1144,10 @@ class NasHubAndMultiMachineTests(unittest.TestCase):
                     "session_name": "gpu-broker Win联调",
                     "summary": "在 Windows 台式机完成推理节点验证。",
                     "outputs": "D:\\code\\gpu-broker",
+                    "sources": [
+                        {"kind": "session", "id": "ag-win-1", "bucket": "antigravity", "machine": "win-pc"},
+                        {"kind": "session", "id": "invented-id"},
+                    ],
                     "active_span": "14:00-15:00",
                     "estimated_hours": 1.0,
                     "status": "进行中",
@@ -834,7 +1165,7 @@ class NasHubAndMultiMachineTests(unittest.TestCase):
 
             def do_POST(self) -> None:
                 length = int(self.headers.get("Content-Length") or "0")
-                _ = self.rfile.read(length)
+                self.server.request_body = json.loads(self.rfile.read(length))
                 body = json.dumps(
                     {"choices": [{"message": {"content": json.dumps(mock_reply, ensure_ascii=False)}}]},
                     ensure_ascii=False,
@@ -864,6 +1195,10 @@ class NasHubAndMultiMachineTests(unittest.TestCase):
                 self.assertEqual(result["machines"], ["win-pc"])
                 self.assertEqual(result["personal_estimated_hours"], 1.0)
                 self.assertEqual(result["work_items"][0]["machine"], "win-pc")
+                sources = result["work_items"][0]["sources"]
+                self.assertEqual([ref["id"] for ref in sources], ["ag-win-1"])
+                self.assertEqual(sources[0]["workspace"], "D:\\code\\gpu-broker")
+                self.assertIn("填写支持本条描述的 sources", llm_srv.request_body["messages"][0]["content"])
         finally:
             llm_srv.shutdown()
             llm_srv.server_close()

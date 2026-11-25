@@ -21,6 +21,8 @@ from zoneinfo import ZoneInfo
 
 import multi_machine
 import remote_client
+from project_identity import ProjectCatalog, edit_registry, item_name, load_registry, name_key
+from provenance import SOURCE_ARCHIVE_MISSING, SOURCE_PENDING, SOURCE_RECORDED, SourceIndex, format_sources, source_key
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.environ.get("DAILY_MEMORY_CONFIG_PATH") or os.path.join(BASE_DIR, "config.json")
@@ -77,7 +79,24 @@ def load_all_days(data_dir: str = DEFAULT_DATA_DIR) -> list[dict[str, Any]]:
     return [by_day[k] for k in sorted(by_day.keys())]
 
 
+def project_candidates(data_dir: str) -> list[dict[str, Any]]:
+    days = load_all_days(data_dir)
+    catalog = ProjectCatalog(days, load_registry(data_dir))
+    projects = aggregate_projects(days, catalog=catalog)
+    seen = {p["project_id"] for p in projects}
+    fields = ("project_id", "project", "aliases", "scope", "category", "last_date", "status", "next_step")
+    candidates = [
+        {**{k: p[k] for k in fields}, "sessions": "；".join(p["recent_sessions"])[:160]} for p in projects
+    ]
+    return candidates + [p for p in catalog.projects.values() if p["project_id"] not in seen]
+
+
 def load_raw_day(workday: str, data_dir: str = DEFAULT_DATA_DIR) -> dict[str, Any] | None:
+    try:
+        if datetime.fromisoformat(workday).date().isoformat() != workday:
+            return None
+    except ValueError:
+        return None
     ym = workday[:7]
     candidates = [
         os.path.join(data_dir, "raw", ym, f"raw_{workday}.json"),
@@ -179,9 +198,11 @@ def aggregate_projects(
     days: list[dict[str, Any]],
     scope: str = "all",
     machine_filter: str | None = None,
+    catalog: ProjectCatalog | None = None,
 ) -> list[dict[str, Any]]:
     """Aggregate chronological day summaries into per-project current-state snapshots."""
     ordered_days = sorted(days, key=lambda d: str(d.get("workday", "")))
+    catalog = catalog if catalog is not None else ProjectCatalog(ordered_days)
     by_proj: dict[str, list[tuple[dict[str, Any], dict[str, Any]]]] = defaultdict(list)
 
     for day in ordered_days:
@@ -192,11 +213,13 @@ def aggregate_projects(
                 continue
             if not _matches_machine(it.get("machine"), day_machines, machine_filter):
                 continue
-            proj = str(it.get("project") or "未命名项目").strip()
-            by_proj[proj].append((day, it))
+            identity = catalog.for_item(it)
+            by_proj[identity["project_id"]].append((day, it))
 
     results: list[dict[str, Any]] = []
-    for proj, pairs in by_proj.items():
+    for identity_id, pairs in by_proj.items():
+        identity = catalog.projects.get(identity_id) or catalog.for_item(pairs[0][1])
+        proj = identity["project"]
         dates = [str(d["workday"]) for d, _ in pairs]
         first_d = min(dates)
         last_d = max(dates)
@@ -257,11 +280,13 @@ def aggregate_projects(
                 break
 
         last_day_pairs = [(d, it) for d, it in pairs if str(d["workday"]) == last_d]
-        latest_brief = _extract_latest_brief(proj, last_day_pairs[-1][0], [it for _, it in last_day_pairs])
+        last_day = last_day_pairs[-1][0]
+        briefs = catalog.briefs(last_day.get("project_briefs") or {})
+        latest_brief = _extract_latest_brief(proj, {"project_briefs": briefs}, [it for _, it in last_day_pairs])
 
         results.append(
             {
-                "project": proj,
+                **identity,
                 "scope": max(scopes.items(), key=lambda kv: kv[1])[0],
                 "category": max(cats.items(), key=lambda kv: kv[1])[0],
                 "first_date": first_d,
@@ -287,10 +312,12 @@ def render_memory_index(
     days: list[dict[str, Any]],
     tz_name: str = "Asia/Shanghai",
     now_str: str | None = None,
+    catalog: ProjectCatalog | None = None,
 ) -> str:
     ordered_days = sorted(days, key=lambda d: str(d.get("workday", "")))
-    work_projs = aggregate_projects(ordered_days, scope="work")
-    personal_projs = aggregate_projects(ordered_days, scope="personal")
+    catalog = catalog if catalog is not None else ProjectCatalog(ordered_days)
+    work_projs = aggregate_projects(ordered_days, scope="work", catalog=catalog)
+    personal_projs = aggregate_projects(ordered_days, scope="personal", catalog=catalog)
     all_projs = sorted(
         work_projs + personal_projs,
         key=lambda r: (r["last_date"], r["total_hours"], r["project"]),
@@ -395,9 +422,10 @@ def generate_memory_index(
     days: list[dict[str, Any]],
     output_path: str | None = None,
     tz_name: str = "Asia/Shanghai",
+    catalog: ProjectCatalog | None = None,
 ) -> dict[str, Any]:
     target = os.path.expanduser(output_path or resolve_index_path())
-    content = render_memory_index(days, tz_name=tz_name)
+    content = render_memory_index(days, tz_name=tz_name, catalog=catalog)
     out_dir = os.path.dirname(os.path.abspath(target))
     os.makedirs(out_dir, exist_ok=True)
     tmp_path = target + ".tmp.md"
@@ -406,8 +434,8 @@ def generate_memory_index(
     os.replace(tmp_path, target)
 
     ordered = sorted(days, key=lambda d: str(d.get("workday", "")))
-    work_cnt = len(aggregate_projects(ordered, scope="work"))
-    personal_cnt = len(aggregate_projects(ordered, scope="personal"))
+    work_cnt = len(aggregate_projects(ordered, scope="work", catalog=catalog))
+    personal_cnt = len(aggregate_projects(ordered, scope="personal", catalog=catalog))
     return {
         "path": target,
         "days": len(ordered),
@@ -417,119 +445,89 @@ def generate_memory_index(
     }
 
 
-def extract_raw_matches(
-    workday: str,
-    terms: list[str],
-    data_dir: str = DEFAULT_DATA_DIR,
-    limit: int = 8,
-    machine_filter: str | None = None,
-) -> dict[str, Any]:
-    raw = load_raw_day(workday, data_dir=data_dir)
-    if not raw:
-        return {}
-    raw_machines = raw.get("machines")
+def source_fields(item: dict[str, Any]) -> dict[str, Any]:
+    sources = item.get("sources") or []
+    status = SOURCE_RECORDED if sources else SOURCE_PENDING
+    if sources and item.get("source_status") == SOURCE_ARCHIVE_MISSING:
+        status = SOURCE_ARCHIVE_MISSING
+    return {"sources": sources, "source_status": status}
 
-    sessions: list[dict[str, Any]] = []
-    for bucket in ("antigravity", "codex", "workbuddy", "t3_other"):
-        for s in raw.get(bucket) or []:
-            if not isinstance(s, dict):
-                continue
-            if not _matches_machine(s.get("machine") or raw.get("machine"), raw_machines, machine_filter):
-                continue
-            blob = " ".join(
-                [
-                    str(s.get("source") or bucket),
-                    str(s.get("machine") or ""),
-                    str(s.get("title") or ""),
-                    str(s.get("display_title") or ""),
-                    str(s.get("workspace") or ""),
-                    str(s.get("cwd") or ""),
-                    " ".join(str(x) for x in (s.get("user_prompts") or [])),
-                    " ".join(str(x) for x in (s.get("assistant_milestones") or [])),
-                    str(s.get("last_assistant_reply") or ""),
-                ]
-            )
-            if matches_terms(blob, terms):
-                sessions.append(
-                    {
-                        "source": s.get("source") or bucket,
-                        "machine": s.get("machine") or raw.get("machine") or "",
-                        "id": s.get("id", ""),
-                        "title": s.get("display_title") or s.get("title") or "",
-                        "workspace": s.get("workspace") or s.get("cwd") or "",
-                        "active_span": s.get("active_span", ""),
-                        "user_prompts": (s.get("user_prompts") or [])[:4],
-                        "assistant_milestones": (s.get("assistant_milestones") or [])[:3],
+
+def resolve_item_sources(
+    items_by_day: dict[str, list[dict[str, Any]]], data_dir: str, machine_filter: str | None,
+) -> list[dict[str, Any]]:
+    details = []
+    for workday, items in items_by_day.items():
+        if not any(item.get("sources") for item in items):
+            continue
+        raw = load_raw_day(workday, data_dir=data_dir) or {}
+        index = SourceIndex(raw)
+        sessions, repos, files = {}, {}, {}
+        for item in items:
+            expected = 0
+            resolved_refs = []
+            for ref in item.get("sources") or []:
+                if not _matches_machine(ref.get("machine"), raw.get("machines"), machine_filter):
+                    continue
+                expected += 1
+                match = index.lookup(ref)
+                if match is None and item.get("source_status") == SOURCE_ARCHIVE_MISSING:
+                    match = index.resolve(ref)
+                if not match:
+                    continue
+                canonical, record = match
+                resolved_refs.append(canonical)
+                kind, identifier, machine, bucket, repo_path = source_key(canonical)
+                if kind == "session":
+                    sessions[source_key(canonical)] = {
+                        "source": record.get("source") or bucket,
+                        "machine": machine,
+                        "id": identifier,
+                        "title": record.get("display_title") or record.get("title") or "",
+                        "workspace": canonical["workspace"],
+                        "active_span": record.get("active_span", ""),
+                        "user_prompts": (record.get("user_prompts") or [])[:4],
+                        "assistant_milestones": (record.get("assistant_milestones") or [])[:3],
                     }
-                )
-
-    git_hits: list[dict[str, Any]] = []
-    for repo in raw.get("git") or []:
-        if not isinstance(repo, dict):
-            continue
-        if not _matches_machine(repo.get("machine") or raw.get("machine"), raw_machines, machine_filter):
-            continue
-        matched_commits = []
-        for c in repo.get("commits") or []:
-            blob = " ".join(
-                [
-                    str(repo.get("repo") or ""),
-                    str(repo.get("repo_name") or ""),
-                    str(repo.get("machine") or ""),
-                    str(c.get("subject") or ""),
-                    " ".join(str(x) for x in (c.get("files") or [])),
-                ]
-            )
-            if matches_terms(blob, terms):
-                matched_commits.append(
-                    {
-                        "hash": c.get("hash", ""),
-                        "time": c.get("time", ""),
-                        "subject": c.get("subject", ""),
-                        "files": (c.get("files") or [])[:8],
+                elif kind == "commit":
+                    repo, commit = record
+                    repo_info = repos.setdefault((machine, repo_path), {
+                        "repo": repo_path, "repo_name": repo.get("repo_name") or repo_path,
+                        "machine": machine, "commits": {},
+                    })
+                    repo_info["commits"][identifier] = {
+                        "hash": identifier, "time": commit.get("time", ""),
+                        "subject": commit.get("subject") or commit.get("message") or "",
+                        "files": canonical["files"],
                     }
-                )
-        if matched_commits:
-            git_hits.append(
-                {
-                    "repo": repo.get("repo", ""),
-                    "repo_name": repo.get("repo_name", ""),
-                    "machine": repo.get("machine") or raw.get("machine") or "",
-                    "commits": matched_commits[:5],
-                }
-            )
+                else:
+                    group = record.get("group", "")
+                    files[source_key(canonical)] = {
+                        "group": group, "machine": machine, "latest_time": record.get("latest_time", ""),
+                        "sample_files": [identifier],
+                    }
+            if len(resolved_refs) < expected:
+                item["raw_sources_unavailable"] = expected - len(resolved_refs)
+            elif resolved_refs and not machine_filter and item.get("source_status") == SOURCE_ARCHIVE_MISSING:
+                item["sources"] = resolved_refs
+                item["source_status"] = SOURCE_RECORDED
+        if sessions or repos or files:
+            details.append({
+                "workday": workday,
+                "sessions": list(sessions.values()),
+                "git": [{**repo, "commits": list(repo["commits"].values())} for repo in repos.values()],
+                "files": list(files.values()),
+            })
+    return details
 
-    file_hits: list[dict[str, Any]] = []
-    for fg in raw.get("files") or []:
-        if not isinstance(fg, dict):
-            continue
-        if not _matches_machine(fg.get("machine") or raw.get("machine"), raw_machines, machine_filter):
-            continue
-        blob = " ".join(
-            [
-                str(fg.get("group") or ""),
-                str(fg.get("machine") or ""),
-                " ".join(str(x) for x in (fg.get("sample_files") or [])),
-            ]
-        )
-        if matches_terms(blob, terms):
-            file_hits.append(
-                {
-                    "group": fg.get("group", ""),
-                    "machine": fg.get("machine") or raw.get("machine") or "",
-                    "latest_time": fg.get("latest_time", ""),
-                    "sample_files": (fg.get("sample_files") or [])[:8],
-                }
-            )
 
-    if not (sessions or git_hits or file_hits):
-        return {}
-    return {
-        "workday": workday,
-        "sessions": sessions[:limit],
-        "git": git_hits[:limit],
-        "files": file_hits[:limit],
-    }
+def raw_for_results(
+    items: list[dict[str, Any]], data_dir: str, machine_filter: str | None,
+) -> list[dict[str, Any]]:
+    items_by_day = defaultdict(list)
+    for item in items:
+        items_by_day[item["workday"]].append(item)
+    return resolve_item_sources(items_by_day, data_dir, machine_filter)
 
 
 def query_project_timeline(
@@ -542,11 +540,14 @@ def query_project_timeline(
     data_dir: str = DEFAULT_DATA_DIR,
     status_filter: str | None = None,
     machine_filter: str | None = None,
+    catalog: ProjectCatalog | None = None,
 ) -> dict[str, Any]:
-    terms = parse_terms(project_query)
+    query_key = name_key(project_query)
+    terms = query_key.split()
+    catalog = catalog if catalog is not None else ProjectCatalog(days, load_registry(data_dir))
+    exact_match = catalog.lookup(project_query) if query_key in catalog.confirmed_names or query_key in catalog.by_id else None
     entries: list[dict[str, Any]] = []
-    matched_projects: set[str] = set()
-    matched_dates: list[str] = []
+    matched_projects: dict[str, dict] = {}
 
     for d in sorted(days, key=lambda x: str(x.get("workday", "")), reverse=not asc):
         wd = str(d.get("workday", ""))
@@ -559,17 +560,21 @@ def query_project_timeline(
                 continue
             if not _matches_machine(it.get("machine"), day_machines, machine_filter):
                 continue
-            proj = str(it.get("project") or "")
-            if matches_terms(proj, terms):
-                matched_projects.add(proj)
-                if wd not in matched_dates:
-                    matched_dates.append(wd)
+            identity = catalog.for_item(it)
+            if exact_match is not None:
+                matched = identity["project_id"] == exact_match["project_id"]
+            else:
+                matched = any(matches_terms(name_key(label), terms)
+                              for label in [identity["project"], *identity["aliases"]])
+            if matched:
+                matched_projects[identity["project_id"]] = identity
                 entries.append(
                     {
                         "workday": wd,
                         "weekday": d.get("weekday", ""),
                         "scope": item_scope,
-                        "project": proj,
+                        **identity,
+                        "project_label": item_name(it),
                         "category": it.get("category", ""),
                         "tool": it.get("tool") or it.get("source") or "",
                         "machine": it.get("machine", ""),
@@ -580,22 +585,18 @@ def query_project_timeline(
                         "next_step": it.get("next_step", ""),
                         "active_span": it.get("active_span", ""),
                         "estimated_hours": it.get("estimated_hours", 0),
+                        **source_fields(it),
                     }
                 )
 
     sliced = entries[:limit]
-    raw_details: list[dict[str, Any]] = []
-    if include_raw:
-        for wd in matched_dates[:5]:
-            rm = extract_raw_matches(wd, terms, data_dir=data_dir, machine_filter=machine_filter)
-            if not rm:
-                rm = extract_raw_matches(wd, [], data_dir=data_dir, limit=4, machine_filter=machine_filter)
-            if rm:
-                raw_details.append(rm)
+    raw_details = raw_for_results(sliced, data_dir, machine_filter) if include_raw else []
 
+    projects = sorted(matched_projects.values(), key=lambda p: p["project"])
     return {
         "query": project_query,
-        "matched_projects": sorted(matched_projects),
+        "matched_projects": [p["project"] for p in projects],
+        "matched_identities": projects,
         "total_matches": len(entries),
         "entries": sliced,
         "raw": raw_details,
@@ -612,10 +613,12 @@ def query_keyword(
     status_filter: str | None = None,
     machine_filter: str | None = None,
     asc: bool = False,
+    catalog: ProjectCatalog | None = None,
 ) -> dict[str, Any]:
     terms = parse_terms(keyword)
+    catalog = catalog if catalog is not None else ProjectCatalog(days, load_registry(data_dir))
+    exact_project = catalog.lookup(keyword)
     hits: list[dict[str, Any]] = []
-    raw_hits: list[dict[str, Any]] = []
 
     for d in sorted(days, key=lambda x: str(x.get("workday", "")), reverse=not asc):
         wd = str(d.get("workday", ""))
@@ -631,18 +634,21 @@ def query_keyword(
                     continue
                 if not _matches_machine(it.get("machine"), day_machines, machine_filter):
                     continue
+                identity = catalog.for_item(it)
                 blob = " ".join(
                     str(it.get(k) or "")
                     for k in ("project", "category", "tool", "machine", "session_name", "summary", "outputs", "next_step")
                 )
-                if matches_terms(blob, terms):
+                names = " ".join([identity["project"], *identity["aliases"]])
+                if identity == exact_project or matches_terms(f"{blob} {names}", terms):
                     day_matched = True
                     hits.append(
                         {
                             "kind": "work_item",
                             "workday": wd,
                             "scope": item_scope,
-                            "project": it.get("project", ""),
+                            **identity,
+                            "project_label": item_name(it),
                             "tool": it.get("tool") or it.get("source") or "",
                             "machine": it.get("machine", ""),
                             "session_name": it.get("session_name", ""),
@@ -650,6 +656,7 @@ def query_keyword(
                             "summary": it.get("summary", ""),
                             "outputs": it.get("outputs", ""),
                             "next_step": it.get("next_step", ""),
+                            **source_fields(it),
                         }
                     )
 
@@ -671,6 +678,7 @@ def query_keyword(
                             "session_name": li.get("session_name", ""),
                             "status": "-",
                             "summary": li.get("summary", ""),
+                            **source_fields(li),
                             "outputs": "-",
                             "next_step": "-",
                         }
@@ -695,16 +703,14 @@ def query_keyword(
                     }
                 )
 
-        if include_raw and len(raw_hits) < 6:
-            rm = extract_raw_matches(wd, terms, data_dir=data_dir, machine_filter=machine_filter)
-            if rm:
-                raw_hits.append(rm)
+    sliced = hits[:limit]
+    raw_hits = raw_for_results(sliced, data_dir, machine_filter) if include_raw else []
 
     return {
         "query": keyword,
         "scope": scope,
         "total_matches": len(hits),
-        "hits": hits[:limit],
+        "hits": sliced,
         "raw": raw_hits,
     }
 
@@ -716,9 +722,10 @@ def query_projects(
     status_filter: str | None = None,
     machine_filter: str | None = None,
     keyword: str | None = None,
+    catalog: ProjectCatalog | None = None,
 ) -> list[dict[str, Any]]:
     proj_scope = "all" if scope == "life" else scope
-    projs = aggregate_projects(days, scope=proj_scope, machine_filter=machine_filter)
+    projs = aggregate_projects(days, scope=proj_scope, machine_filter=machine_filter, catalog=catalog)
     if status_filter:
         projs = [p for p in projs if status_filter in p["status"]]
     if keyword:
@@ -727,7 +734,8 @@ def query_projects(
             p
             for p in projs
             if matches_terms(
-                f"{p['project']} {p['category']} {p['latest_summary']} {p['next_step']}",
+                f"{p['project']} {' '.join(p['aliases'])} {p['project_id']} "
+                f"{p['category']} {p['latest_summary']} {p['next_step']}",
                 terms,
             )
         ]
@@ -745,6 +753,7 @@ def query_by_project(
     data_dir: str = DEFAULT_DATA_DIR,
     asc: bool = False,
     limit: int = 30,
+    catalog: ProjectCatalog | None = None,
 ) -> dict[str, Any]:
     return query_project_timeline(
         days,
@@ -756,6 +765,7 @@ def query_by_project(
         data_dir=data_dir,
         status_filter=status_filter,
         machine_filter=machine_filter,
+        catalog=catalog,
     )
 
 
@@ -770,6 +780,7 @@ def query_by_keyword(
     data_dir: str = DEFAULT_DATA_DIR,
     asc: bool = False,
     limit: int = 15,
+    catalog: ProjectCatalog | None = None,
 ) -> dict[str, Any]:
     return query_keyword(
         days,
@@ -781,6 +792,7 @@ def query_by_keyword(
         status_filter=status_filter,
         machine_filter=machine_filter,
         asc=asc,
+        catalog=catalog,
     )
 
 
@@ -792,22 +804,33 @@ def query_exact_date(
     data_dir: str = DEFAULT_DATA_DIR,
     machine_filter: str | None = None,
     keyword: str | None = None,
+    catalog: ProjectCatalog | None = None,
 ) -> dict[str, Any]:
-    matched = [d for d in days if str(d.get("workday")) == exact_date]
-    day = matched[0] if matched else None
-    if day and machine_filter:
-        day = dict(day)
-        day["work_items"] = [
-            it for it in (day.get("work_items") or []) if _matches_machine(it.get("machine"), day.get("machines"), machine_filter)
+    day = next((d for d in days if str(d.get("workday")) == exact_date), None)
+    if day is None:
+        return {"workday": exact_date, "day": None, "raw": None}
+    catalog = catalog if catalog is not None else ProjectCatalog(days, load_registry(data_dir))
+    day = dict(day)
+    for collection in ("work_items", "life_items"):
+        day[collection] = [
+            {**item, **source_fields(item)} for item in day.get(collection) or []
+            if _matches_machine(item.get("machine"), day.get("machines"), machine_filter)
         ]
-        day["life_items"] = [
-            li for li in (day.get("life_items") or []) if _matches_machine(li.get("machine"), day.get("machines"), machine_filter)
+    day["work_items"] = [
+        {**item, **catalog.for_item(item), "project_label": item_name(item)}
+        for item in day["work_items"]
+    ]
+    day["project_briefs"] = catalog.briefs(day.get("project_briefs") or {})
+    raw_m = None
+    if include_raw:
+        terms = parse_terms(keyword)
+        items = [
+            item for item in [*day["work_items"], *day["life_items"]]
+            if matches_terms(" ".join(str(item.get(key) or "") for key in (
+                "project", "topic", "session_name", "summary", "outputs",
+            )), terms)
         ]
-    raw_m = (
-        extract_raw_matches(exact_date, parse_terms(keyword), data_dir=data_dir, machine_filter=machine_filter)
-        if include_raw
-        else None
-    )
+        raw_m = next(iter(resolve_item_sources({exact_date: items}, data_dir, machine_filter)), None)
     return {"workday": exact_date, "day": day, "raw": raw_m}
 
 
@@ -859,10 +882,23 @@ def format_projects_md(projs: list[dict[str, Any]], limit: int = 50) -> str:
     return "\n".join(lines)
 
 
+def format_item_sources(item: dict[str, Any]) -> str:
+    citations = format_sources(item.get("sources") or [], separator="；", status=item.get("source_status", ""))
+    unavailable = item.get("raw_sources_unavailable", 0)
+    if unavailable:
+        citations += f"（{unavailable} 条原始记录当前不可用）"
+    return f"  - 出处：{citations}"
+
+
 def format_project_query_md(res: dict[str, Any]) -> str:
     lines = [f"### 项目时间线：`{res['query']}`（匹配项目 {len(res['matched_projects'])} 个，共 {res['total_matches']} 条记录）"]
     if res["matched_projects"]:
         lines.append(f"> 项目名：{', '.join(res['matched_projects'])}")
+    if len(res.get("matched_identities") or []) == 1:
+        project = res["matched_identities"][0]
+        lines.append(f"> 项目 ID：`{project['project_id']}`")
+        if project["aliases"]:
+            lines.append(f"> 别名：{'、'.join(project['aliases'])}")
     lines.append("")
     if not res["entries"]:
         lines.append("_无匹配记录_")
@@ -879,6 +915,7 @@ def format_project_query_md(res: dict[str, Any]) -> str:
             lines.append(f"  - 产出：{e['outputs']}")
         if e["next_step"] and e["next_step"] != "-":
             lines.append(f"  - 下一步：{e['next_step']}")
+        lines.append(format_item_sources(e))
     lines.extend(format_raw_section(res.get("raw") or []))
     return "\n".join(lines)
 
@@ -901,6 +938,8 @@ def format_keyword_query_md(res: dict[str, Any]) -> str:
             lines.append(f"  - 产出：{h['outputs']}")
         if h["next_step"] and h["next_step"] != "-":
             lines.append(f"  - 下一步：{h['next_step']}")
+        if h["kind"] != "day_headline":
+            lines.append(format_item_sources(h))
     lines.extend(format_raw_section(res.get("raw") or []))
     return "\n".join(lines)
 
@@ -927,12 +966,14 @@ def format_exact_date_md(res: dict[str, Any]) -> str:
             )
             if it.get("outputs") and it.get("outputs") != "-":
                 lines.append(f"  - 产出：{it['outputs']}")
+            lines.append(format_item_sources(it))
     life_items = day.get("life_items") or []
     if life_items:
         lines.extend(["", "#### 随想与探索"])
         for li in life_items:
             mach = f" | @{li['machine']}" if li.get("machine") else ""
             lines.append(f"- [{li.get('tool', '')}{mach}] **{li.get('topic', '')}** (`{li.get('session_name', '')}`): {li.get('summary', '')}")
+            lines.append(format_item_sources(li))
     if raw:
         lines.extend(format_raw_section([raw]))
     return "\n".join(lines)
@@ -977,25 +1018,73 @@ def _run_remote_query(args: argparse.Namespace, rc: remote_client.RemoteConfig) 
     if args.machine:
         params["machine"] = args.machine
     if args.raw:
-        params["raw"] = "1"
+        params["raw"] = "sources"
     if args.asc:
         params["asc"] = "1"
 
     if args.project:
         params["project"] = args.project
-        text, _ = remote_client.request_text(rc, "GET", "/api/v1/query", params=params, write=False)
-        return text
-    if args.keyword and not args.projects:
+        render = format_project_query_md
+    elif args.keyword and not args.projects:
         params["keyword"] = args.keyword
-        text, _ = remote_client.request_text(rc, "GET", "/api/v1/query", params=params, write=False)
-        return text
-    if args.date:
-        text, _ = remote_client.request_text(rc, "GET", "/api/v1/query", params=params, write=False)
-        return text
+        render = format_keyword_query_md
+    elif args.date:
+        render = format_exact_date_md
+    else:
+        render = None
+
+    if render:
+        params["format"] = "json"
+        result, _ = remote_client.request_json(rc, "GET", "/api/v1/query", params=params, write=False)
+        day = result.get("day") or {}
+        for items in (result.get("entries"), result.get("hits"), day.get("work_items"), day.get("life_items")):
+            for item in items or []:
+                if item.get("kind") != "day_headline" and "source_status" not in item:
+                    item.update(source_fields({}))
+        return json.dumps(result, ensure_ascii=False, indent=2) if args.as_json else render(result)
     if args.keyword:
         params["keyword"] = args.keyword
     text, _ = remote_client.request_text(rc, "GET", "/api/v1/projects", params=params, write=False)
     return text
+
+
+def run_project_review(args: argparse.Namespace, rc: remote_client.RemoteConfig, use_remote: bool) -> None:
+    if args.project_review:
+        if use_remote:
+            result, _ = remote_client.request_json(rc, "GET", "/api/v1/project-review")
+            pending = result["suggestions"]
+        else:
+            data_dir = args.data_dir or DEFAULT_DATA_DIR
+            days = load_all_days(data_dir)
+            pending = ProjectCatalog(days, load_registry(data_dir)).suggestions(days)
+        if args.as_json:
+            print(json.dumps({"suggestions": pending}, ensure_ascii=False, indent=2))
+        elif pending:
+            for suggestion in pending[: args.limit]:
+                target = suggestion["suggested"]["project"]
+                print(f"- 「{suggestion['label']}」→「{target}」"
+                      f"（{', '.join(suggestion['dates'])}） {suggestion['reason']}".rstrip())
+        else:
+            print("暂无待确认的项目归类建议。")
+        return
+
+    action = "merge" if args.merge_projects is not None else "split"
+    target, *labels = args.merge_projects if action == "merge" else args.split_project
+    if use_remote:
+        result, _ = remote_client.request_json(
+            rc, "POST", "/api/v1/project-review",
+            json_body={"action": action, "target": target, "labels": labels}, write=True,
+        )
+        project = result["project"]
+    else:
+        data_dir = args.data_dir or DEFAULT_DATA_DIR
+        project = edit_registry(data_dir, load_all_days(data_dir), action, target, labels)
+    if args.as_json:
+        print(json.dumps(project, ensure_ascii=False, indent=2))
+    else:
+        print(f"已保存「{project['project']}」({project['project_id']})")
+        if project["aliases"]:
+            print(f"别名 {'、'.join(project['aliases'])}")
 
 
 def main() -> None:
@@ -1007,7 +1096,13 @@ def main() -> None:
     parser.add_argument("--index-output", help="Override output path for --rebuild-index.")
     parser.add_argument("--index", action="store_true", help="Print latest MEMORY_INDEX.md (from NAS or local/cache).")
     parser.add_argument("--projects", action="store_true", help="List aggregated projects sorted by latest activity.")
-    parser.add_argument("--project", help="Show chronological timeline for matching project name(s).")
+    parser.add_argument("--project", help="Show a project timeline by name, alias, or stable ID.")
+    decisions = parser.add_mutually_exclusive_group()
+    decisions.add_argument("--project-review", action="store_true", help="List AI suggestions awaiting a decision.")
+    decisions.add_argument("--merge-projects", nargs="+", metavar="PROJECT",
+                           help="Merge one or more names into the first project.")
+    decisions.add_argument("--split-project", nargs="+", metavar="NAME",
+                           help="Restore an alias as a project, or split named aliases into the first name.")
     parser.add_argument("--keyword", "-k", help="Search keyword(s) (space-separated AND terms) across history.")
     parser.add_argument("--date", help="Inspect a specific workday (YYYY-MM-DD).")
     parser.add_argument("--days", type=int, help="Limit search to the most recent N calendar days.")
@@ -1021,7 +1116,7 @@ def main() -> None:
     )
     parser.add_argument("--status", help="Filter by status substring (e.g. 进行中).")
     parser.add_argument("--machine", help="Filter results by machine_id (e.g. mac, win-pc).")
-    parser.add_argument("--raw", action="store_true", help="Also drill into data/raw/ for session UUIDs, Git, and files.")
+    parser.add_argument("--raw", action="store_true", help="Open the archived evidence cited by each returned item.")
     parser.add_argument("--asc", action="store_true", help="Sort timeline entries oldest-first.")
     parser.add_argument("--limit", type=int, default=15, help="Max results to return (default: 15).")
     parser.add_argument("--json", dest="as_json", action="store_true", help="Output raw JSON instead of Markdown.")
@@ -1065,6 +1160,13 @@ def main() -> None:
         and (args.remote or rc.configured)
     )
 
+    if args.project_review or args.merge_projects or args.split_project:
+        try:
+            run_project_review(args, rc, use_remote)
+        except (OSError, ValueError, RuntimeError) as exc:
+            parser.exit(2, f"ERROR: {exc}\n")
+        return
+
     offline_notice = ""
     if use_remote:
         try:
@@ -1095,9 +1197,10 @@ def main() -> None:
 
     target_data_dir = args.data_dir or DEFAULT_DATA_DIR
     days = load_all_days(target_data_dir)
+    catalog = ProjectCatalog(days, load_registry(target_data_dir))
 
     if args.index:
-        print(render_memory_index(days, tz_name=str(cfg.get("timezone") or "Asia/Shanghai")))
+        print(render_memory_index(days, tz_name=str(cfg.get("timezone") or "Asia/Shanghai"), catalog=catalog))
         return
 
     if args.rebuild_index:
@@ -1105,6 +1208,7 @@ def main() -> None:
             days,
             output_path=args.index_output or resolve_index_path(cfg),
             tz_name=str(cfg.get("timezone") or "Asia/Shanghai"),
+            catalog=catalog,
         )
         if args.as_json:
             print(json.dumps(stats, ensure_ascii=False, indent=2))
@@ -1124,7 +1228,7 @@ def main() -> None:
         exact_date=args.date,
     )
 
-    if args.date:
+    if args.date and not args.project and not args.keyword:
         res = query_exact_date(
             days,
             args.date,
@@ -1132,6 +1236,7 @@ def main() -> None:
             data_dir=target_data_dir,
             machine_filter=args.machine,
             keyword=args.keyword,
+            catalog=catalog,
         )
         if not res["day"]:
             print(f"No summary found for {args.date}", file=sys.stderr)
@@ -1153,6 +1258,7 @@ def main() -> None:
             data_dir=target_data_dir,
             asc=args.asc,
             limit=args.limit,
+            catalog=catalog,
         )
         if args.as_json:
             print(json.dumps(res, ensure_ascii=False, indent=2))
@@ -1171,6 +1277,7 @@ def main() -> None:
             data_dir=target_data_dir,
             asc=args.asc,
             limit=args.limit,
+            catalog=catalog,
         )
         if args.as_json:
             print(json.dumps(res, ensure_ascii=False, indent=2))
@@ -1184,6 +1291,7 @@ def main() -> None:
         status_filter=args.status,
         machine_filter=args.machine,
         keyword=args.keyword,
+        catalog=catalog,
     )
     if args.as_json:
         print(json.dumps({"total": len(projs), "projects": projs[: args.limit]}, ensure_ascii=False, indent=2))

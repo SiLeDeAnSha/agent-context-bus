@@ -29,6 +29,8 @@ import multi_machine
 import query_memory
 import summarizer
 import write_excel
+from project_identity import ProjectCatalog, edit_registry, load_registry
+from provenance import verify_day_sources
 
 
 MCP_PROTOCOL_VERSION = "2025-03-26"
@@ -201,6 +203,7 @@ class HubState:
             days,
             output_path=self.memory_index_path,
             tz_name=self.timezone_name,
+            catalog=ProjectCatalog(days, load_registry(self.data_dir)),
         )
 
     def get_index_markdown(self) -> str:
@@ -216,7 +219,14 @@ class HubState:
             raise ValueError("Empty summary payload.")
         with self._write_lock:
             merged_days = [
-                multi_machine.save_machine_summary(self.data_dir, machine_id, day_obj)
+                multi_machine.save_machine_summary(
+                    self.data_dir,
+                    machine_id,
+                    verify_day_sources(
+                        day_obj,
+                        query_memory.load_raw_day(str(day_obj.get("workday") or ""), data_dir=self.data_dir),
+                    ),
+                )
                 for day_obj in days_payload
             ]
             excel_res = write_excel.update_split_workbooks(
@@ -347,6 +357,7 @@ def _filter_raw_by_machine(raw_payload: dict[str, Any], machine: str | None) -> 
 
 def _execute_query(state: HubState, args: dict[str, Any]) -> tuple[str, Any]:
     days = query_memory.load_all_days(state.data_dir)
+    catalog = ProjectCatalog(days, load_registry(state.data_dir))
     date_from = args.get("date_from") or args.get("from")
     date_to = args.get("date_to") or args.get("to")
     recent_days = int(args["days"]) if args.get("days") not in (None, "") else None
@@ -372,6 +383,8 @@ def _execute_query(state: HubState, args: dict[str, Any]) -> tuple[str, Any]:
             scope=scope,
             status_filter=status_filter,
             machine_filter=machine_filter,
+            keyword=args.get("keyword"),
+            catalog=catalog,
         )
         return query_memory.format_projects_md(res), res
     if exact_date and not args.get("project") and not args.get("keyword"):
@@ -381,6 +394,7 @@ def _execute_query(state: HubState, args: dict[str, Any]) -> tuple[str, Any]:
             include_raw=include_raw,
             data_dir=state.data_dir,
             machine_filter=machine_filter,
+            catalog=catalog,
         )
         return query_memory.format_exact_date_md(res), res
     if args.get("project"):
@@ -394,6 +408,7 @@ def _execute_query(state: HubState, args: dict[str, Any]) -> tuple[str, Any]:
             data_dir=state.data_dir,
             asc=asc,
             limit=limit,
+            catalog=catalog,
         )
         return query_memory.format_project_query_md(res), res
     if args.get("keyword"):
@@ -407,6 +422,7 @@ def _execute_query(state: HubState, args: dict[str, Any]) -> tuple[str, Any]:
             data_dir=state.data_dir,
             asc=asc,
             limit=limit,
+            catalog=catalog,
         )
         return query_memory.format_keyword_query_md(res), res
     res = query_memory.query_projects(
@@ -414,6 +430,7 @@ def _execute_query(state: HubState, args: dict[str, Any]) -> tuple[str, Any]:
         scope=scope,
         status_filter=status_filter,
         machine_filter=machine_filter,
+        catalog=catalog,
     )
     return query_memory.format_projects_md(res), res
 
@@ -561,7 +578,16 @@ def make_handler(state: HubState) -> type[BaseHTTPRequestHandler]:
             if path == "/api/v1/bundle":
                 md = state.get_index_markdown()
                 days = query_memory.load_all_days(state.data_dir)
-                self._send_json(200, {"memory_index_md": md, "days": days, "total_days": len(days)})
+                self._send_json(200, {
+                    "memory_index_md": md, "days": days, "total_days": len(days),
+                    "project_registry": load_registry(state.data_dir),
+                })
+                return
+
+            if path == "/api/v1/project-review":
+                days = query_memory.load_all_days(state.data_dir)
+                catalog = ProjectCatalog(days, load_registry(state.data_dir))
+                self._send_json(200, {"suggestions": catalog.suggestions(days)})
                 return
 
             if path == "/api/v1/projects":
@@ -573,6 +599,7 @@ def make_handler(state: HubState) -> type[BaseHTTPRequestHandler]:
                     "date_to": qs.get("to"),
                     "status": qs.get("status"),
                     "machine": qs.get("machine"),
+                    "keyword": qs.get("keyword"),
                 }
                 md, data = _execute_query(state, args)
                 if qs.get("format") == "json":
@@ -592,7 +619,7 @@ def make_handler(state: HubState) -> type[BaseHTTPRequestHandler]:
                     "scope": qs.get("scope", "all"),
                     "status": qs.get("status"),
                     "machine": qs.get("machine"),
-                    "raw": qs.get("raw", "").lower() in ("1", "true", "yes"),
+                    "raw": qs.get("raw", "").lower() in ("1", "true", "yes", "sources"),
                     "asc": qs.get("asc", "").lower() in ("1", "true", "yes"),
                     "limit": qs.get("limit") or 20,
                 }
@@ -667,6 +694,23 @@ def make_handler(state: HubState) -> type[BaseHTTPRequestHandler]:
                 body = self._read_json_body()
             except Exception as exc:
                 self._send_json(400, {"error": f"invalid_json:{exc}"})
+                return
+
+            if path == "/api/v1/project-review":
+                if not isinstance(body, dict):
+                    self._send_json(400, {"error": "body_must_be_object"})
+                    return
+                try:
+                    with state._write_lock:
+                        days = query_memory.load_all_days(state.data_dir)
+                        project = edit_registry(
+                            state.data_dir, days, body.get("action"), body.get("target"), body.get("labels", []),
+                        )
+                        state.rebuild_index_locked()
+                except ValueError as exc:
+                    self._send_json(400, {"error": str(exc)})
+                    return
+                self._send_json(200, {"ok": True, "project": project})
                 return
 
             if path == "/api/v1/ingest/raw":

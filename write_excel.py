@@ -15,6 +15,8 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 import query_memory
+from project_identity import ProjectCatalog, load_registry
+from provenance import SOURCE_PENDING, format_sources, verify_day_sources
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.environ.get("DAILY_MEMORY_CONFIG_PATH") or os.path.join(BASE_DIR, "config.json")
@@ -73,7 +75,7 @@ HEADERS = {
         "项目名称", "日期", "星期", "分类", "工具",
         "会话名称 / 来源标识", "做了什么", "核心产出 / 改动",
         "阶段状态", "遗留 / 下一步",
-        "活跃时段", "单对话跨度(h)", "人工备注",
+        "活跃时段", "单对话跨度(h)", "人工备注", "出处",
     ],
     SHEET_LIFE: [
         "日期", "工具", "会话名称 / 来源标识", "主题 / 关键词",
@@ -92,12 +94,13 @@ HEADER_COMMENTS = {
     (SHEET_PROJECTS, 14): "该项目下所有 WorkBuddy 独立对话跨度之和（多窗口并发时不扣重）。",
     (SHEET_PROJECTS, 15): "该项目全部明细行「单对话跨度(h)」累加总计（反映跨任务并行累计投入）。",
     (SHEET_DETAILS, 12): "单场对话自身的活跃跨度（间隔≤30分钟合并；若同时开多个窗口并行干活，各行相加会大于实际墙钟时长）。",
+    (SHEET_DETAILS, 14): "写入日报时核验的会话 ID、工作目录、Git 提交或文件路径。",
 }
 
 COL_WIDTHS = {
     SHEET_OVERVIEW: [15, 10, 28, 38, 36, 36, 38, 14, 16, 13, 10, 18, 22],
     SHEET_PROJECTS: [27, 16, 14, 14, 10, 13, 34, 38, 36, 36, 26, 14, 15, 14, 14, 38, 22],
-    SHEET_DETAILS: [26, 14, 10, 16, 14, 38, 46, 36, 13, 30, 18, 15, 22],
+    SHEET_DETAILS: [26, 14, 10, 16, 14, 38, 46, 36, 13, 30, 18, 15, 22, 52],
     SHEET_LIFE: [14, 14, 38, 24, 52, 18, 22],
 }
 
@@ -356,6 +359,7 @@ def build_rows_from_day(day: dict[str, Any]) -> tuple[list[list[Any]], list[list
                 item.get("active_span", ""),
                 float(item.get("estimated_hours") or 0.0),
                 item.get("manual_note", ""),
+                format_sources(item.get("sources") or [], status=item.get("source_status", "")),
             ]
         )
 
@@ -655,7 +659,7 @@ def style_sheet(ws: Any, sheet_name: str, rows: list[list[Any]], theme_key: str)
     elif sheet_name == SHEET_LIFE:
         badge_cols = {2}
 
-    note_col_idx = len(cols)
+    note_col_idx = cols.index("人工备注") + 1
     hour_col_set = HOUR_COLS[sheet_name]
 
     for offset, row_vals in enumerate(rows):
@@ -754,6 +758,8 @@ def update_excel(
 
     kept_overview = [r for r in existing[SHEET_OVERVIEW] if str(r[0]) not in incoming_dates]
     kept_details = [r for r in existing[SHEET_DETAILS] if str(r[1]) not in incoming_dates]
+    for row in kept_details:
+        row[-1] = row[-1] or SOURCE_PENDING
     kept_life = [r for r in existing[SHEET_LIFE] if str(r[0]) not in incoming_dates]
 
     for day in days:
@@ -931,6 +937,11 @@ def main() -> None:
             data = json.load(f)
         all_days.extend(normalize_days_payload(data))
 
+    target_data_dir = args.data_dir or os.path.join(BASE_DIR, "data")
+    all_days = [
+        verify_day_sources(day, query_memory.load_raw_day(str(day["workday"]), data_dir=target_data_dir))
+        for day in all_days
+    ]
     work_path = os.path.expanduser(args.work_output or cfg["excel_path"])
     personal_path = os.path.expanduser(args.personal_output or cfg["personal_excel_path"])
     split_months = bool(cfg.get("monthly_folders", True)) and not args.no_monthly
@@ -940,14 +951,15 @@ def main() -> None:
     if res.get("months"):
         print(f"Updated monthly workbooks: {', '.join(sorted(res['months'].keys()))}")
     if not args.work_output and not args.personal_output and not args.no_index_sync:
-        target_data_dir = args.data_dir or os.path.join(BASE_DIR, "data")
         idx_res = sync_json_indexes(all_days, data_dir=target_data_dir)
         print(f"Synced JSON indexes: {idx_res}")
         if not args.no_memory_index:
+            history = query_memory.load_all_days(target_data_dir)
             mem_res = query_memory.generate_memory_index(
-                query_memory.load_all_days(target_data_dir),
+                history,
                 output_path=query_memory.resolve_index_path(cfg),
                 tz_name=str(cfg.get("timezone") or "Asia/Shanghai"),
+                catalog=ProjectCatalog(history, load_registry(target_data_dir)),
             )
             print(f"Updated memory index: {mem_res}")
 
