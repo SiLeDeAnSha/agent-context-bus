@@ -6,6 +6,7 @@ from typing import Any
 SESSION_BUCKETS = ("antigravity", "codex", "workbuddy", "t3_other")
 SOURCE_PENDING = "来源待核对"
 SOURCE_RECORDED = "已记录"
+SOURCE_ARCHIVE_MISSING = "原始档案暂不可用"
 
 
 def source_key(ref: dict[str, Any]) -> tuple[str, ...]:
@@ -82,21 +83,46 @@ class SourceIndex:
         return self.records.get(key[:2], {}).get((*key, ref.get("workspace") or ""))
 
 
-def verify_day_sources(day: dict[str, Any], raw: dict[str, Any]) -> dict[str, Any]:
+def saved_source_refs(claims: Any) -> list[dict[str, Any]]:
+    refs = {}
+    for claim in claims if isinstance(claims, list) else []:
+        if not isinstance(claim, dict):
+            continue
+        kind, identifier = claim.get("kind"), claim.get("id")
+        if kind not in ("session", "commit", "file") or not isinstance(identifier, str) or not identifier:
+            continue
+        ref = {"kind": kind, "id": identifier}
+        for key in ("machine", "bucket", "workspace", "repo"):
+            if isinstance(claim.get(key), str):
+                ref[key] = claim[key]
+        if kind == "commit" and isinstance(claim.get("files"), list):
+            ref["files"] = [name for name in claim["files"] if isinstance(name, str)]
+        refs.setdefault(source_key(ref), ref)
+    return list(refs.values())
+
+
+def verify_day_sources(day: dict[str, Any], raw: dict[str, Any] | None) -> dict[str, Any]:
     """Validate incoming citations, copying source metadata from the raw archive."""
-    sources = SourceIndex(raw)
+    sources = SourceIndex(raw) if raw is not None else None
     result = dict(day)
     for collection in ("work_items", "life_items"):
-        if collection in day:
-            result[collection] = [
-                {**item, "sources": sources.verify(item.get("sources"))}
-                for item in day[collection] or []
-                if isinstance(item, dict)
-            ]
+        if collection not in day:
+            continue
+        result[collection] = []
+        for item in day[collection] or []:
+            if not isinstance(item, dict):
+                continue
+            claims = item.get("sources")
+            refs = sources.verify(claims) if sources is not None else saved_source_refs(claims)
+            record = {**item, "sources": refs}
+            record.pop("source_status", None)
+            if sources is None and refs:
+                record["source_status"] = SOURCE_ARCHIVE_MISSING
+            result[collection].append(record)
     return result
 
 
-def format_sources(sources: list[dict[str, Any]], separator: str = "\n") -> str:
+def format_sources(sources: list[dict[str, Any]], separator: str = "\n", status: str = "") -> str:
     lines = []
     for ref in sources:
         machine = f" @{ref['machine']}" if ref.get("machine") else ""
@@ -106,7 +132,10 @@ def format_sources(sources: list[dict[str, Any]], separator: str = "\n") -> str:
             lines.append(f"会话 {ref['id']}{machine}{workspace}")
         elif kind == "commit":
             files = f" · {', '.join(ref['files'])}" if ref.get("files") else ""
-            lines.append(f"Git {ref['id']}{machine} · {ref['repo']}{files}")
+            repo = f" · {ref['repo']}" if ref.get("repo") else ""
+            lines.append(f"Git {ref['id']}{machine}{repo}{files}")
         elif kind == "file":
             lines.append(f"文件 {ref['id']}{machine}")
+    if lines and status == SOURCE_ARCHIVE_MISSING:
+        lines.append(SOURCE_ARCHIVE_MISSING)
     return separator.join(lines) or SOURCE_PENDING

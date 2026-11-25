@@ -224,7 +224,7 @@ class HubState:
                     machine_id,
                     verify_day_sources(
                         day_obj,
-                        query_memory.load_raw_day(str(day_obj.get("workday") or ""), data_dir=self.data_dir) or {},
+                        query_memory.load_raw_day(str(day_obj.get("workday") or ""), data_dir=self.data_dir),
                     ),
                 )
                 for day_obj in days_payload

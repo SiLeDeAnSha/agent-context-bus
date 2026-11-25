@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo
 import multi_machine
 import remote_client
 from project_identity import ProjectCatalog, edit_registry, item_name, load_registry, name_key
-from provenance import SOURCE_PENDING, SOURCE_RECORDED, SourceIndex, format_sources, source_key
+from provenance import SOURCE_ARCHIVE_MISSING, SOURCE_PENDING, SOURCE_RECORDED, SourceIndex, format_sources, source_key
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.environ.get("DAILY_MEMORY_CONFIG_PATH") or os.path.join(BASE_DIR, "config.json")
@@ -447,7 +447,10 @@ def generate_memory_index(
 
 def source_fields(item: dict[str, Any]) -> dict[str, Any]:
     sources = item.get("sources") or []
-    return {"sources": sources, "source_status": SOURCE_RECORDED if sources else SOURCE_PENDING}
+    status = SOURCE_RECORDED if sources else SOURCE_PENDING
+    if sources and item.get("source_status") == SOURCE_ARCHIVE_MISSING:
+        status = SOURCE_ARCHIVE_MISSING
+    return {"sources": sources, "source_status": status}
 
 
 def resolve_item_sources(
@@ -461,16 +464,19 @@ def resolve_item_sources(
         index = SourceIndex(raw)
         sessions, repos, files = {}, {}, {}
         for item in items:
-            expected = found = 0
+            expected = 0
+            resolved_refs = []
             for ref in item.get("sources") or []:
                 if not _matches_machine(ref.get("machine"), raw.get("machines"), machine_filter):
                     continue
                 expected += 1
                 match = index.lookup(ref)
+                if match is None and item.get("source_status") == SOURCE_ARCHIVE_MISSING:
+                    match = index.resolve(ref)
                 if not match:
                     continue
-                found += 1
                 canonical, record = match
+                resolved_refs.append(canonical)
                 kind, identifier, machine, bucket, repo_path = source_key(canonical)
                 if kind == "session":
                     sessions[source_key(canonical)] = {
@@ -500,8 +506,11 @@ def resolve_item_sources(
                         "group": group, "machine": machine, "latest_time": record.get("latest_time", ""),
                         "sample_files": [identifier],
                     }
-            if found < expected:
-                item["raw_sources_unavailable"] = expected - found
+            if len(resolved_refs) < expected:
+                item["raw_sources_unavailable"] = expected - len(resolved_refs)
+            elif resolved_refs and not machine_filter and item.get("source_status") == SOURCE_ARCHIVE_MISSING:
+                item["sources"] = resolved_refs
+                item["source_status"] = SOURCE_RECORDED
         if sessions or repos or files:
             details.append({
                 "workday": workday,
@@ -874,7 +883,7 @@ def format_projects_md(projs: list[dict[str, Any]], limit: int = 50) -> str:
 
 
 def format_item_sources(item: dict[str, Any]) -> str:
-    citations = format_sources(item.get("sources") or [], separator="；")
+    citations = format_sources(item.get("sources") or [], separator="；", status=item.get("source_status", ""))
     unavailable = item.get("raw_sources_unavailable", 0)
     if unavailable:
         citations += f"（{unavailable} 条原始记录当前不可用）"

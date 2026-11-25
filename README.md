@@ -7,6 +7,14 @@
 2. **个人技术折腾表**：`~/Documents/DailyReport/个人技术与折腾汇总.xlsx`（4 个 Sheet：`每日概览`、`项目总览`、`项目流程明细`、`生活与随想记录`）
    - 收录工具开发、AI 工作流、系统运维、硬件调试等技术折腾，以及生活探索与闲聊。
 
+## 首次导入并查项目
+
+在仓库目录运行 `python3 onboarding.py`（Windows PowerShell 用 `python onboarding.py`）。向导会检查本机的 Antigravity、Codex、WorkBuddy 和 T3 Code 会话来源。按回车导入全部可读客户端，或输入编号选择。导入范围是最近 7 天，含当前工作日，日期按配置的时区和工作日切换时间计算。
+
+导入后，终端会展示真实项目的一条会话记录及出处，并给出可直接复制的 `query_memory.py --project` 命令。项目名优先取客户端目录或工作区，缺少这些信息时使用会话标题。同一次导入碰到同名的不同工作区时，会附上完整路径和机器标识。把命令中的 `--project` 和其值换成 `--projects`，即可浏览这次导入的全部项目。
+
+首次导入在本机运行，使用 Python 3.10+，无需 NAS、Excel 或模型 API。结果按次保存在被 Git 忽略的 `data/first-import/` 下，可用 `--output-dir` 指定其他上级目录。Codex 的 `.zst` 归档需要 Python 3.14+ 或 `zstandard`，Windows 如缺时区数据库可安装 `tzdata`。需要定时报表或跨机同步时，再继续下方的配置。
+
 ## 文件夹分月归档结构
 
 为避免单表随时间变得臃肿、同时保留跨月项目汇总和全局检索能力，输出目录默认采用 **「根目录全量总表 + 按月子文件夹分卷」** 双层结构：
@@ -30,7 +38,18 @@
 - Git 引用需要 `{"kind":"commit","id":"原始记录的 hash","repo":"仓库路径","machine":"机器 ID"}`。
 - 文件引用需要 `{"kind":"file","id":"原始记录 paths 中的完整路径","machine":"机器 ID"}`。
 
-同一条进展可以保存多个出处。`--raw` 只展开结果中各条进展引用的原始记录。离线缓存仍显示已保存的出处，原始记录不可用时会另行标明。
+同一条进展可以保存多个出处。`--raw` 只展开结果中各条进展引用的原始记录。离线缓存仍显示已保存的出处。重导入摘要时若缺少当天原始档案，保留出处并标为「原始档案暂不可用」。原档可用时会校验引用。
+
+## 查原会话片段
+
+日常先查 `MEMORY_INDEX.md` 或 `query_memory.py`。需要找摘要和 `--raw` 省略的命令、报错原文或对话时，用出处里的会话 ID 缩小范围，再搜索本机原会话。
+
+```bash
+python3 search_sessions.py --keyword '报错中的一段原文' --session-id '<会话 ID>'
+python3 search_sessions.py --keyword 'ffprobe' --client codex --date 2026-11-24 --limit 3
+```
+
+按字面匹配关键词，忽略大小写。默认只返回最近 5 个命中片段，附会话 ID、时间和原文件位置。可用 `--from`、`--to` 限定工作日范围，或用 `--json` 输出结构化结果。检索覆盖本机 Antigravity 完整转录、Codex 活跃及归档会话、WorkBuddy 项目日志和 T3 Code 会话数据库中的消息、命令与工具输出。Codex 的 `.zst` 归档需要 Python 3.14+ 或 Python 的 `zstandard` 包。
 
 ## 项目身份、别名和纠错
 
@@ -42,6 +61,8 @@ python3 query_memory.py --merge-projects 'ComfyUI 人像与视频管线' 'comfyu
 python3 query_memory.py --project '保脸工作流'
 python3 query_memory.py --split-project '保脸工作流'
 ```
+
+也可以用合并前的别名 ID 拆分，拆出后保留原有名称和 ID。
 
 - 合并保留第一个项目的 ID。被合并的名称和原 ID 都能查到合并后的项目。
 - 拆分可把一个别名恢复为独立项目，也可用 `--split-project '新项目主名称' '已合并的别名 A' '已合并的别名 B'` 将多个别名转到指定项目。拆出的名称会独立归档，包括之前和以后以该名称记录的进展。对尚未合并的候选名称执行拆分，会将其确认为独立项目。
@@ -65,7 +86,7 @@ python3 query_memory.py --split-project '保脸工作流'
 - 云端同步预处理：`prepare_gsheets.py`
 - 单元测试：`test_daily_summary.py`
 
-## 快速开始
+## 配置完整日报流程
 
 ```bash
 python3 -m venv .venv

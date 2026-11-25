@@ -359,7 +359,7 @@ def build_rows_from_day(day: dict[str, Any]) -> tuple[list[list[Any]], list[list
                 item.get("active_span", ""),
                 float(item.get("estimated_hours") or 0.0),
                 item.get("manual_note", ""),
-                format_sources(item.get("sources") or []),
+                format_sources(item.get("sources") or [], status=item.get("source_status", "")),
             ]
         )
 
@@ -939,7 +939,7 @@ def main() -> None:
 
     target_data_dir = args.data_dir or os.path.join(BASE_DIR, "data")
     all_days = [
-        verify_day_sources(day, query_memory.load_raw_day(str(day["workday"]), data_dir=target_data_dir) or {})
+        verify_day_sources(day, query_memory.load_raw_day(str(day["workday"]), data_dir=target_data_dir))
         for day in all_days
     ]
     work_path = os.path.expanduser(args.work_output or cfg["excel_path"])

@@ -3,11 +3,13 @@
 
 import argparse
 from collections import defaultdict
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 import glob
 import io
 import json
 import os
+from pathlib import Path
 import re
 import sqlite3
 import subprocess
@@ -40,9 +42,16 @@ def open_zstd_text(path: str):
         return io.TextIOWrapper(reader, encoding="utf-8")
     raise RuntimeError("zstd decompression requires Python 3.14+ or `pip install zstandard`.")
 
+
+def supports_zstd() -> bool:
+    return _stdlib_zstd is not None or _thirdparty_zstd is not None
+
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 DATA_DIR = os.path.join(BASE_DIR, "data")
+ANTIGRAVITY_DB = "~/.gemini/antigravity/conversation_summaries.db"
+T3_DB = "~/.t3/userdata/statev2.sqlite"
 
 
 EXAMPLE_CONFIG_PATH = os.path.join(BASE_DIR, "config.example.json")
@@ -52,6 +61,28 @@ def load_config() -> dict[str, Any]:
     path = CONFIG_PATH if os.path.exists(CONFIG_PATH) else EXAMPLE_CONFIG_PATH
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def open_session_db(path: str) -> sqlite3.Connection:
+    db_path = Path(path).resolve()
+    uri = db_path.as_uri()
+    conn = sqlite3.connect(f"{uri}?mode=ro", uri=True)
+    try:
+        conn.execute("PRAGMA schema_version").fetchone()
+        return conn
+    except sqlite3.Error as exc:
+        conn.close()
+        # A closed WAL database can need to create sidecars even in read-only mode.
+        # Only bypass locking if there is no pending WAL or rollback journal.
+        if getattr(exc, "sqlite_errorcode", None) != getattr(sqlite3, "SQLITE_CANTOPEN", None):
+            raise
+        for suffix in ("-wal", "-journal"):
+            try:
+                if os.stat(str(db_path) + suffix).st_size:
+                    raise exc
+            except FileNotFoundError:
+                pass
+        return sqlite3.connect(f"{uri}?mode=ro&immutable=1", uri=True)
 
 
 def parse_iso_dt(value: str) -> datetime | None:
@@ -268,37 +299,50 @@ def load_antigravity_annotations() -> tuple[dict[str, str], dict[str, str]]:
     return titles, side_parent
 
 
+def list_antigravity_transcript_paths() -> list[str]:
+    brain_dir = os.path.expanduser("~/.gemini/antigravity/brain")
+    return glob.glob(os.path.join(brain_dir, "*", ".system_generated", "logs", "transcript.jsonl"))
+
+
+def load_antigravity_conversations() -> dict[str, dict[str, Any]]:
+    path = os.path.expanduser(ANTIGRAVITY_DB)
+    if not os.path.isfile(path):
+        return {}
+    with closing(open_session_db(path)) as conn:
+        rows = conn.execute(
+            "SELECT conversation_id, title, workspace_uris, parent_conversation_id, nesting_depth, project_id "
+            "FROM conversation_summaries"
+        ).fetchall()
+    return {
+        cid: {
+            "title": title or "",
+            "workspace_uris": ws or "",
+            "parent_id": parent_id or "",
+            "depth": depth or 0,
+            "project_id": project_id or "",
+        }
+        for cid, title, ws, parent_id, depth, project_id in rows
+    }
+
+
 def collect_antigravity(
     start_dt: datetime,
     end_dt: datetime,
     tz: ZoneInfo,
     workday: str,
     cfg: dict[str, Any],
+    *,
+    allow_missing_metadata: bool = False,
 ) -> tuple[list[dict[str, Any]], list[datetime]]:
-    db_path = os.path.expanduser("~/.gemini/antigravity/conversation_summaries.db")
-    brain_dir = os.path.expanduser("~/.gemini/antigravity/brain")
     markers = cfg.get("self_filter_markers", [])
     proj_names = load_antigravity_projects()
     ann_titles, side_parent = load_antigravity_annotations()
-
-    meta_map: dict[str, dict[str, Any]] = {}
-    if os.path.exists(db_path):
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-        rows = conn.execute(
-            """
-            SELECT conversation_id, title, workspace_uris, parent_conversation_id, nesting_depth, project_id
-            FROM conversation_summaries
-            """
-        ).fetchall()
-        conn.close()
-        for cid, title, ws, parent_id, depth, project_id in rows:
-            meta_map[cid] = {
-                "title": title or "",
-                "workspace_uris": ws or "",
-                "parent_id": parent_id or "",
-                "depth": depth or 0,
-                "project_id": project_id or "",
-            }
+    try:
+        meta_map = load_antigravity_conversations()
+    except (OSError, sqlite3.Error):
+        if not allow_missing_metadata:
+            raise
+        meta_map = {}
 
     conv_data: dict[str, dict[str, Any]] = {}
     side_extra_ts: dict[str, list[datetime]] = defaultdict(list)
@@ -306,7 +350,7 @@ def collect_antigravity(
     side_extra_replies: dict[str, list[str]] = defaultdict(list)
     all_ts: list[datetime] = []
 
-    for tpath in glob.glob(os.path.join(brain_dir, "*", ".system_generated", "logs", "transcript.jsonl")):
+    for tpath in list_antigravity_transcript_paths():
         cid = tpath.split(os.sep)[-4]
         meta = meta_map.get(cid, {})
         if meta.get("parent_id") or meta.get("depth", 0) > 0:
@@ -476,6 +520,8 @@ def collect_codex(
     tz: ZoneInfo,
     workday: str,
     cfg: dict[str, Any],
+    *,
+    paths: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[datetime]]:
     markers = cfg.get("self_filter_markers", [])
     thread_names = load_codex_thread_names()
@@ -483,7 +529,7 @@ def collect_codex(
     all_ts: list[datetime] = []
     seen_stems: set[str] = set()
 
-    for path in list_codex_rollout_paths():
+    for path in paths if paths is not None else list_codex_rollout_paths():
         if datetime.fromtimestamp(os.path.getmtime(path), tz=timezone.utc) < start_dt:
             continue
 
@@ -499,7 +545,7 @@ def collect_codex(
         if thread_name == "Guardian review":
             continue
 
-        is_archived = "/archived_sessions/" in path
+        is_archived = "archived_sessions" in Path(path).parts
         cwd = ""
         step_ts: list[datetime] = []
         user_msgs: list[str] = []
@@ -523,9 +569,11 @@ def collect_codex(
                         continue
                     rtype = obj.get("type")
                     payload = obj.get("payload") or {}
-                    if rtype == "session_meta" and isinstance(payload, dict) and not session_uuid:
-                        session_uuid = str(payload.get("session_id") or "")
-                        thread_name = thread_names.get(session_uuid, thread_name)
+                    if rtype == "session_meta" and isinstance(payload, dict):
+                        cwd = cwd or str(payload.get("cwd") or "")
+                        if not session_uuid:
+                            session_uuid = str(payload.get("id") or payload.get("session_id") or "")
+                            thread_name = thread_names.get(session_uuid, thread_name)
                     if rtype == "turn_context" and isinstance(payload, dict) and payload.get("cwd"):
                         cwd = payload["cwd"]
                     dt = parse_iso_dt(str(obj.get("timestamp") or ""))
@@ -610,15 +658,14 @@ def load_workbuddy_metadata() -> tuple[dict[str, dict[str, Any]], dict[str, str]
 
     if os.path.exists(db_path):
         try:
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-            spaces = dict(conn.execute("SELECT id, name FROM spaces").fetchall())
-            rows = conn.execute(
-                """
-                SELECT id, COALESCE(custom_title, title), space_id, cwd, is_background_automation, deleted_at
-                FROM sessions
-                """
-            ).fetchall()
-            conn.close()
+            with closing(open_session_db(db_path)) as conn:
+                spaces = dict(conn.execute("SELECT id, name FROM spaces").fetchall())
+                rows = conn.execute(
+                    """
+                    SELECT id, COALESCE(custom_title, title), space_id, cwd, is_background_automation, deleted_at
+                    FROM sessions
+                    """
+                ).fetchall()
             for sid, title, space_id, cwd, is_bg, deleted_at in rows:
                 if is_bg:
                     continue
@@ -802,7 +849,7 @@ def load_t3_code_data(
     db_path: str | None = None,
 ) -> tuple[dict[str, dict[str, str]], dict[str, dict[str, Any]], dict[str, set[str]], list[tuple[str, str, str, str]]]:
     """Read T3 Code statev2.sqlite projects, top-level threads, provider session IDs, and messages."""
-    path = os.path.expanduser(db_path or "~/.t3/userdata/statev2.sqlite")
+    path = os.path.expanduser(db_path or T3_DB)
     if not os.path.exists(path):
         return {}, {}, {}, []
 
@@ -811,8 +858,9 @@ def load_t3_code_data(
     provider_sids: dict[str, set[str]] = defaultdict(set)
     messages: list[tuple[str, str, str, str]] = []
 
+    conn = None
     try:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        conn = open_session_db(path)
         for pid, title, ws_root in conn.execute(
             "SELECT project_id, title, workspace_root FROM projection_projects"
         ):
@@ -861,9 +909,11 @@ def load_t3_code_data(
             ORDER BY created_at ASC
             """
         ).fetchall()
-        conn.close()
     except Exception:
         return {}, {}, {}, []
+    finally:
+        if conn is not None:
+            conn.close()
 
     return projects, threads, provider_sids, messages
 
@@ -1272,36 +1322,55 @@ def load_existing_projects(cfg: dict[str, Any]) -> list[dict[str, Any]]:
     return projects[:60]
 
 
-def collect_day(workday: str, cfg: dict[str, Any], machine_id: str | None = None) -> dict[str, Any]:
+def build_day_payload(
+    workday: str,
+    cfg: dict[str, Any],
+    machine_id: str | None = None,
+    *,
+    session_clients: set[str] | None = None,
+    codex_paths: list[str] | None = None,
+) -> dict[str, Any]:
+    """Build a day's raw records. An explicit client selection limits collection to sessions."""
     tz_name = cfg["timezone"]
     tz = ZoneInfo(tz_name)
     start_dt, end_dt = workday_bounds(workday, tz_name, int(cfg["day_start_hour"]))
     mid = multi_machine.normalize_machine_id(machine_id or cfg.get("machine_id"))
 
-    ag_items, ag_ts = collect_antigravity(start_dt, end_dt, tz, workday, cfg)
-    codex_items, codex_ts = collect_codex(start_dt, end_dt, tz, workday, cfg)
-    wb_items, wb_ts = collect_workbuddy(start_dt, end_dt, tz, workday, cfg)
-
-    existing_codex_ids = {str(it.get("id") or "") for it in codex_items if it.get("id")}
-    t3_ag, t3_ag_ts, t3_cx, t3_cx_ts, t3_wb, t3_wb_ts, t3_other, t3_other_ts, cx_hints = collect_t3_code(
-        start_dt, end_dt, tz, workday, cfg, existing_codex_ids=existing_codex_ids
-    )
-    if cx_hints:
+    clients = session_clients if session_clients is not None else {"antigravity", "codex", "workbuddy", "t3"}
+    args = (start_dt, end_dt, tz, workday, cfg)
+    ag_items, ag_ts = ([], [])
+    codex_items, codex_ts = ([], [])
+    wb_items, wb_ts = ([], [])
+    t3_other, t3_other_ts = ([], [])
+    if "antigravity" in clients:
+        ag_items, ag_ts = collect_antigravity(*args, allow_missing_metadata=session_clients is not None)
+    if "codex" in clients:
+        codex_items, codex_ts = collect_codex(*args, paths=codex_paths)
+    if "workbuddy" in clients:
+        wb_items, wb_ts = collect_workbuddy(*args)
+    if "t3" in clients:
+        existing_codex_ids = {str(it["id"]) for it in codex_items if it.get("id")}
+        t3_ag, t3_ag_ts, t3_cx, t3_cx_ts, t3_wb, t3_wb_ts, t3_other, t3_other_ts, cx_hints = collect_t3_code(
+            *args, existing_codex_ids=existing_codex_ids
+        )
         for it in codex_items:
             sid = str(it.get("id") or "")
             if sid in cx_hints:
                 it["title"] = cx_hints[sid]
                 it["client"] = "T3 Code"
 
-    ag_items = sorted(ag_items + t3_ag, key=lambda x: x["active_span"])
-    codex_items = sorted(codex_items + t3_cx, key=lambda x: x["active_span"])
-    wb_items = sorted(wb_items + t3_wb, key=lambda x: x["active_span"])
-    ag_ts = ag_ts + t3_ag_ts
-    codex_ts = codex_ts + t3_cx_ts
-    wb_ts = wb_ts + t3_wb_ts
+        ag_items = sorted(ag_items + t3_ag, key=lambda x: x["active_span"])
+        codex_items = sorted(codex_items + t3_cx, key=lambda x: x["active_span"])
+        wb_items = sorted(wb_items + t3_wb, key=lambda x: x["active_span"])
+        ag_ts += t3_ag_ts
+        codex_ts += t3_cx_ts
+        wb_ts += t3_wb_ts
 
-    git_items, git_ts = collect_git(start_dt, end_dt, tz, cfg)
-    file_groups = collect_local_files(start_dt, end_dt, tz, cfg)
+    git_items, git_ts, file_groups, existing_projects = [], [], [], []
+    if session_clients is None:
+        git_items, git_ts = collect_git(start_dt, end_dt, tz, cfg)
+        file_groups = collect_local_files(start_dt, end_dt, tz, cfg)
+        existing_projects = load_existing_projects(cfg)
 
     all_ts = ag_ts + codex_ts + wb_ts + t3_other_ts + git_ts
     gap_min = int(cfg["merge_gap_minutes"])
@@ -1309,7 +1378,7 @@ def collect_day(workday: str, cfg: dict[str, Any], machine_id: str | None = None
         datetime.strptime(workday, "%Y-%m-%d").weekday()
     ]
 
-    payload = {
+    return {
         "workday": workday,
         "weekday": weekday_cn,
         "machine": mid,
@@ -1320,7 +1389,7 @@ def collect_day(workday: str, cfg: dict[str, Any], machine_id: str | None = None
         "codex_hours": estimate_active_hours(codex_ts, gap_min),
         "workbuddy_hours": estimate_active_hours(wb_ts, gap_min),
         "t3_other_hours": estimate_active_hours(t3_other_ts, gap_min),
-        "existing_projects": load_existing_projects(cfg),
+        "existing_projects": existing_projects,
         "counts": {
             "antigravity_sessions": len(ag_items),
             "codex_sessions": len(codex_items),
@@ -1337,9 +1406,10 @@ def collect_day(workday: str, cfg: dict[str, Any], machine_id: str | None = None
         "files": multi_machine.tag_items_with_machine(file_groups, mid),
     }
 
-    raw_month_dir = os.path.join(DATA_DIR, "raw", workday[:7])
-    os.makedirs(raw_month_dir, exist_ok=True)
-    out_path = os.path.join(raw_month_dir, f"raw_{workday}.json")
+
+def collect_day(workday: str, cfg: dict[str, Any], machine_id: str | None = None) -> dict[str, Any]:
+    payload = build_day_payload(workday, cfg, machine_id)
+    out_path = os.path.join(DATA_DIR, "raw", workday[:7], f"raw_{workday}.json")
     multi_machine.atomic_write_json(out_path, payload)
     return payload
 
@@ -1360,29 +1430,14 @@ def collect_all_history_single_pass(cfg: dict[str, Any], end_workday: str) -> li
 
     ann_titles, side_parent = load_antigravity_annotations()
     proj_names = load_antigravity_projects()
-    db_path = os.path.expanduser("~/.gemini/antigravity/conversation_summaries.db")
-    meta_map: dict[str, dict[str, Any]] = {}
-    if os.path.exists(db_path):
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-        for cid, title, ws, parent_id, depth, project_id in conn.execute(
-            "SELECT conversation_id, title, workspace_uris, parent_conversation_id, nesting_depth, project_id FROM conversation_summaries"
-        ):
-            meta_map[cid] = {
-                "title": title or "",
-                "workspace_uris": ws or "",
-                "parent_id": parent_id or "",
-                "depth": depth or 0,
-                "project_id": project_id or "",
-            }
-        conn.close()
+    meta_map = load_antigravity_conversations()
 
-    brain_dir = os.path.expanduser("~/.gemini/antigravity/brain")
     raw_ag: dict[str, tuple[dict[str, Any], str, dict[str, list[datetime]], dict[str, list[str]], dict[str, list[str]]]] = {}
     side_ts: dict[tuple[str, str], list[datetime]] = defaultdict(list)
     side_prompts: dict[tuple[str, str], list[str]] = defaultdict(list)
     side_replies: dict[tuple[str, str], list[str]] = defaultdict(list)
 
-    for tpath in glob.glob(os.path.join(brain_dir, "*", ".system_generated", "logs", "transcript.jsonl")):
+    for tpath in list_antigravity_transcript_paths():
         cid = tpath.split(os.sep)[-4]
         meta = meta_map.get(cid, {})
         if meta.get("parent_id") or meta.get("depth", 0) > 0:

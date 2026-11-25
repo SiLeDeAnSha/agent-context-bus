@@ -6,18 +6,22 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 from datetime import datetime, timedelta
+from hashlib import sha256
 import json
 import ntpath
+import posixpath
 import os
 import re
 from typing import Any
 from urllib import error as urlerror
 from urllib import request as urlrequest
+from urllib.parse import unquote, urlsplit
 from zoneinfo import ZoneInfo
 
 import multi_machine
 import query_memory
-from provenance import verify_day_sources
+from provenance import SESSION_BUCKETS, verify_day_sources
+from project_identity import name_key
 
 
 SYSTEM_PROMPT = """你是一个跨设备、跨端（Antigravity / Codex / WorkBuddy / T3 Code / Git / 本地文件）工作与个人技术记忆汇总助手。
@@ -251,7 +255,64 @@ def normalize_summary_schema(
     return verify_day_sources(out, raw_payload)
 
 
-def fallback_rule_summarize(raw_payload: dict[str, Any]) -> dict[str, Any]:
+def _import_workspace(workspace: str) -> str:
+    if workspace.startswith("["):
+        try:
+            paths = json.loads(workspace)
+        except json.JSONDecodeError:
+            paths = []
+        workspace = str(paths[0]) if isinstance(paths, list) and paths else ""
+    if workspace.startswith("file://"):
+        url = urlsplit(workspace)
+        workspace = unquote(url.path)
+        if url.netloc and url.netloc.lower() != "localhost":
+            workspace = f"//{url.netloc}{workspace}"
+        elif re.match(r"^/[a-zA-Z]:/", workspace):
+            workspace = workspace[1:]
+    if not workspace:
+        return ""
+    if ntpath.splitdrive(workspace)[0]:
+        return ntpath.normcase(ntpath.normpath(workspace))
+    return posixpath.normpath(workspace)
+
+
+def _import_project(session: dict[str, Any], raw: dict[str, Any]) -> tuple[str, str, str]:
+    workspace = _import_workspace(str(session.get("workspace") or session.get("cwd") or "").strip())
+    machine = str(session.get("machine") or raw.get("machine") or "").strip()
+    title = str(session.get("title") or session.get("id") or "未命名会话").strip()
+    name = str(session.get("folder") or "").strip() or ntpath.basename(workspace) or title
+    return name, machine, workspace
+
+
+def first_import_project_labels(raw_days: list[dict[str, Any]]) -> dict[tuple[str, str, str], str]:
+    projects: dict[str, dict[tuple[str, str], str]] = defaultdict(dict)
+    for raw in raw_days:
+        for bucket in SESSION_BUCKETS:
+            for session in raw.get(bucket) or []:
+                if isinstance(session, dict):
+                    name, machine, workspace = _import_project(session, raw)
+                    projects[name_key(name)].setdefault((machine, workspace), name)
+    labels = {}
+    for key, locations in projects.items():
+        if len(locations) < 2:
+            continue
+        qualified = defaultdict(list)
+        for (machine, workspace), name in locations.items():
+            label = f"{name} [{workspace or '工作区未知'} · {machine or '机器未知'}]"
+            qualified[name_key(label)].append(((key, machine, workspace), label))
+        for matches in qualified.values():
+            for identity, label in matches:
+                if len(matches) > 1:
+                    fingerprint = sha256(json.dumps(identity).encode("utf-8")).hexdigest()[:12]
+                    label = f"{label} #{fingerprint}"
+                labels[identity] = label
+    return labels
+
+
+def fallback_rule_summarize(
+    raw_payload: dict[str, Any], *, first_import: bool = False,
+    import_labels: dict[tuple[str, str, str], str] | None = None,
+) -> dict[str, Any]:
     """Deterministic fallback summarizer when no LLM API key is configured (useful for tests/offline)."""
     work_items: list[dict[str, Any]] = []
     project_briefs: dict[str, dict[str, str]] = defaultdict(lambda: {"ag": "-", "codex": "-", "wb": "-"})
@@ -261,6 +322,8 @@ def fallback_rule_summarize(raw_payload: dict[str, Any]) -> dict[str, Any]:
         ("workbuddy", "WorkBuddy", "wb"),
         ("t3_other", "T3 Code", "ag"),
     )
+    if import_labels is None:
+        import_labels = first_import_project_labels([raw_payload]) if first_import else {}
     for bucket, tool_label, pb_key in tool_map:
         for it in raw_payload.get(bucket) or []:
             if not isinstance(it, dict):
@@ -268,6 +331,9 @@ def fallback_rule_summarize(raw_payload: dict[str, Any]) -> dict[str, Any]:
             title = str(it.get("title") or it.get("id") or "未命名会话").strip()
             ws = str(it.get("workspace") or it.get("cwd") or "").strip()
             proj = ntpath.basename(ws.rstrip("/\\")) if ws else title[:24]
+            if first_import:
+                proj, host, workspace = _import_project(it, raw_payload)
+                proj = import_labels.get((name_key(proj), host, workspace), proj)
             prompts = it.get("user_prompts") or []
             milestones = it.get("assistant_milestones") or []
             snippet = str(milestones[-1] if milestones else (prompts[0] if prompts else title))[:140]
@@ -275,14 +341,14 @@ def fallback_rule_summarize(raw_payload: dict[str, Any]) -> dict[str, Any]:
             entry: dict[str, Any] = {
                 "project": proj or "未分类项目",
                 "category": "自动归档",
-                "tool": tool_label,
+                "tool": (it.get("source") or tool_label) if first_import else tool_label,
                 "session_name": title,
                 "summary": snippet,
                 "outputs": ws or "-",
                 "sources": [{"kind": "session", "id": it.get("id"), "bucket": bucket, "machine": machine}],
                 "active_span": str(it.get("active_span") or "-"),
                 "estimated_hours": round(float(it.get("estimated_hours") or 0.0), 2),
-                "status": "阶段完成",
+                "status": "已导入会话" if first_import else "阶段完成",
                 "next_step": "-",
                 "scope": "personal",
             }

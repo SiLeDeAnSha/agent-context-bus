@@ -140,6 +140,8 @@ def edit_registry(data_dir: str, days: list[dict], action: str, target: str, lab
             # An alias can become a project again under its original ID.
             if known and name_key(target) == known["project_id"]:
                 raise ValueError("拆分请使用原始别名或新的项目名称。")
+            if known:
+                target = next((alias for alias in known["aliases"] if project_id(alias) == name_key(target)), target)
             if known and name_key(known["project"]) == name_key(target):
                 target = known["project"]
             if not known and not labels:
