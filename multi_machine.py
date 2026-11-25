@@ -147,7 +147,6 @@ def merge_raw_payloads(workday: str, machine_payloads: dict[str, dict[str, Any]]
         "antigravity": [],
         "codex": [],
         "workbuddy": [],
-        "t3_other": [],
         "git": [],
         "files": [],
     }
@@ -158,7 +157,6 @@ def merge_raw_payloads(workday: str, machine_payloads: dict[str, dict[str, Any]]
     ag_hours = 0.0
     cx_hours = 0.0
     wb_hours = 0.0
-    t3o_hours = 0.0
 
     for mid in machines:
         p = machine_payloads[mid] or {}
@@ -172,7 +170,6 @@ def merge_raw_payloads(workday: str, machine_payloads: dict[str, dict[str, Any]]
         ag_hours += float(p.get("antigravity_hours") or 0.0)
         cx_hours += float(p.get("codex_hours") or 0.0)
         wb_hours += float(p.get("workbuddy_hours") or 0.0)
-        t3o_hours += float(p.get("t3_other_hours") or 0.0)
 
         for ep in p.get("existing_projects") or []:
             if not isinstance(ep, dict):
@@ -182,7 +179,7 @@ def merge_raw_payloads(workday: str, machine_payloads: dict[str, dict[str, Any]]
                 seen_proj_keys.add(pk)
                 existing_projects.append(ep)
 
-        for key in ("antigravity", "codex", "workbuddy", "t3_other"):
+        for key in ("antigravity", "codex", "workbuddy"):
             for it in p.get(key) or []:
                 if not isinstance(it, dict):
                     continue
@@ -216,7 +213,7 @@ def merge_raw_payloads(workday: str, machine_payloads: dict[str, dict[str, Any]]
             seen_bucket_keys["files"].add(dedup)
             buckets["files"].append(item)
 
-    for key in ("antigravity", "codex", "workbuddy", "t3_other"):
+    for key in ("antigravity", "codex", "workbuddy"):
         buckets[key].sort(key=lambda x: (str(x.get("active_span") or ""), str(x.get("machine") or "")))
 
     return {
@@ -229,20 +226,17 @@ def merge_raw_payloads(workday: str, machine_payloads: dict[str, dict[str, Any]]
         "antigravity_hours": round(ag_hours, 2),
         "codex_hours": round(cx_hours, 2),
         "workbuddy_hours": round(wb_hours, 2),
-        "t3_other_hours": round(t3o_hours, 2),
         "existing_projects": existing_projects[:80],
         "counts": {
             "antigravity_sessions": len(buckets["antigravity"]),
             "codex_sessions": len(buckets["codex"]),
             "workbuddy_sessions": len(buckets["workbuddy"]),
-            "t3_other_sessions": len(buckets["t3_other"]),
             "git_repos": len(buckets["git"]),
             "file_groups": len(buckets["files"]),
         },
         "antigravity": buckets["antigravity"],
         "codex": buckets["codex"],
         "workbuddy": buckets["workbuddy"],
-        "t3_other": buckets["t3_other"],
         "git": buckets["git"],
         "files": buckets["files"],
     }
@@ -256,7 +250,7 @@ def merge_summary_payloads(workday: str, machine_summaries: dict[str, dict[str, 
     core_outputs: list[str] = []
     spans: list[str] = []
 
-    ag_h = cx_h = wb_h = t3o_h = est_h = work_h = pers_h = 0.0
+    ag_h = cx_h = wb_h = est_h = work_h = pers_h = 0.0
     work_items: list[dict[str, Any]] = []
     life_items: list[dict[str, Any]] = []
     seen_work: set[str] = set()
@@ -279,7 +273,6 @@ def merge_summary_payloads(workday: str, machine_summaries: dict[str, dict[str, 
         ag_h += float(d.get("antigravity_hours") or 0.0)
         cx_h += float(d.get("codex_hours") or 0.0)
         wb_h += float(d.get("workbuddy_hours") or 0.0)
-        t3o_h += float(d.get("t3_other_hours") or 0.0)
         est_h += float(d.get("estimated_hours") or 0.0)
         work_h += float(d.get("work_estimated_hours") or 0.0)
         pers_h += float(d.get("personal_estimated_hours") or 0.0)
@@ -359,7 +352,6 @@ def merge_summary_payloads(workday: str, machine_summaries: dict[str, dict[str, 
         "antigravity_hours": round(ag_h, 2),
         "codex_hours": round(cx_h, 2),
         "workbuddy_hours": round(wb_h, 2),
-        "t3_other_hours": round(t3o_h, 2),
         "estimated_hours": round(est_h, 2),
         "work_estimated_hours": round(work_h, 2),
         "personal_estimated_hours": round(pers_h, 2),
@@ -395,7 +387,7 @@ def save_machine_raw(data_dir: str, machine_id: str, raw_payload: dict[str, Any]
     stamped = dict(raw_payload)
     stamped["machine"] = mid
     stamped["uploaded_at"] = datetime.now(timezone.utc).isoformat()
-    for key in ("antigravity", "codex", "workbuddy", "t3_other", "git", "files"):
+    for key in ("antigravity", "codex", "workbuddy", "git", "files"):
         if isinstance(stamped.get(key), list):
             stamped[key] = tag_items_with_machine(stamped[key], mid)
 

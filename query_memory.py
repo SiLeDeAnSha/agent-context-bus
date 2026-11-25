@@ -19,6 +19,7 @@ import sys
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import live_memory
 import multi_machine
 import remote_client
 from project_identity import ProjectCatalog, edit_registry, item_name, load_registry, name_key
@@ -324,8 +325,10 @@ def render_memory_index(
     tz_name: str = "Asia/Shanghai",
     now_str: str | None = None,
     catalog: ProjectCatalog | None = None,
+    live_days: list[dict[str, Any]] | None = None,
 ) -> str:
     ordered_days = sorted(days, key=lambda d: str(d.get("workday", "")))
+    archived_workdays = {str(d.get("workday", "")) for d in ordered_days}
     catalog = catalog if catalog is not None else ProjectCatalog(ordered_days)
     work_projs = aggregate_projects(ordered_days, scope="work", catalog=catalog)
     personal_projs = aggregate_projects(ordered_days, scope="personal", catalog=catalog)
@@ -354,8 +357,55 @@ def render_memory_index(
         "- 查某项目完整时间线与关键路径：`python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --project \"<项目关键词>\"`",
         "- 跨项目/随想搜关键词（加 `--raw` 可查会话 UUID、用户指令、Git 提交与改动文件）：`python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --keyword \"<关键词>\" --raw`",
         "- 为项目登记/更新物理目录与关键配置文件：`python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --add-path \"<项目名>\" \"<路径1>\" \"<路径2>\"`",
+        "- 立即记一笔今日关键结论 / 强制刷新实时层：`python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --note \"<项目名>\" \"<关键结论>\"` ｜ `--live-sync`",
         "",
     ]
+
+    active_live = [
+        ld for ld in (live_days or [])
+        if str(ld.get("workday") or "") not in archived_workdays
+        and (ld.get("notes") or ld.get("sessions") or ld.get("git"))
+    ]
+    for ld in active_live[:2]:
+        wd = str(ld.get("workday") or "")
+        upd = str(ld.get("updated_at") or "")
+        upd_short = upd[11:16] if len(upd) >= 16 else upd
+        lines.append(f"## 今日实时动态（`{wd}` · 0 Token 实时层，压实前生效｜刷新 `{upd_short or '-'}`）")
+        lines.append("")
+        notes = list(ld.get("notes") or [])[:10]
+        if notes:
+            lines.append("**关键笔记（`--note`）**")
+            for n in notes:
+                p_lbl = clean_cell(n.get("project"), 40)
+                t_lbl = clean_cell(n.get("time"), 8)
+                txt = clean_cell(n.get("text"), 140)
+                lines.append(f"- `{t_lbl}` **{p_lbl}**：{txt}")
+            lines.append("")
+        sessions = list(ld.get("sessions") or [])[:8]
+        if sessions:
+            lines.extend(
+                [
+                    "| 时间 | 客户端 | 会话标题 | 工作区 | 最新动态 / 摘要 |",
+                    "|---|---|---|---|---|",
+                ]
+            )
+            for s in sessions:
+                summary = s.get("summary") or s.get("last_input") or "-"
+                ws = f"`{clean_cell(s.get('workspace'), 40)}`" if s.get("workspace") else "-"
+                lines.append(
+                    f"| `{clean_cell(s.get('time'), 8)}` | {clean_cell(s.get('tool'), 14)} "
+                    f"| {clean_cell(s.get('title'), 42)} | {ws} | {clean_cell(summary, 95)} |"
+                )
+            lines.append("")
+        commits = list(ld.get("git") or [])[:8]
+        if commits:
+            lines.append("**今日 Git 提交**")
+            for g in commits:
+                lines.append(
+                    f"- `{clean_cell(g.get('time'), 8)}` **{clean_cell(g.get('repo_name'), 28)}** "
+                    f"`{clean_cell(g.get('hash'), 10)}` {clean_cell(g.get('subject'), 90)}"
+                )
+            lines.append("")
 
     if active_projs:
         lines.extend(
@@ -435,9 +485,15 @@ def generate_memory_index(
     output_path: str | None = None,
     tz_name: str = "Asia/Shanghai",
     catalog: ProjectCatalog | None = None,
+    data_dir: str | None = None,
+    live_days: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     target = os.path.expanduser(output_path or resolve_index_path())
-    content = render_memory_index(days, tz_name=tz_name, catalog=catalog)
+    ordered = sorted(days, key=lambda d: str(d.get("workday", "")))
+    if live_days is None and data_dir:
+        archived = {str(d.get("workday", "")) for d in ordered}
+        live_days = live_memory.load_uncompacted_live(data_dir, archived_workdays=archived)
+    content = render_memory_index(days, tz_name=tz_name, catalog=catalog, live_days=live_days)
     out_dir = os.path.dirname(os.path.abspath(target))
     os.makedirs(out_dir, exist_ok=True)
     tmp_path = target + ".tmp.md"
@@ -445,7 +501,6 @@ def generate_memory_index(
         f.write(content)
     os.replace(tmp_path, target)
 
-    ordered = sorted(days, key=lambda d: str(d.get("workday", "")))
     work_cnt = len(aggregate_projects(ordered, scope="work", catalog=catalog))
     personal_cnt = len(aggregate_projects(ordered, scope="personal", catalog=catalog))
     return {
@@ -453,6 +508,7 @@ def generate_memory_index(
         "days": len(ordered),
         "work_projects": work_cnt,
         "personal_projects": personal_cnt,
+        "live_days": len(live_days or []),
         "bytes": len(content.encode("utf-8")),
     }
 
@@ -605,12 +661,23 @@ def query_project_timeline(
     raw_details = raw_for_results(sliced, data_dir, machine_filter) if include_raw else []
 
     projects = sorted(matched_projects.values(), key=lambda p: p["project"])
+    archived = {str(d.get("workday", "")) for d in days}
+    uncompacted = live_memory.load_uncompacted_live(data_dir, archived_workdays=archived)
+    live_hits: list[dict[str, Any]] = []
+    if uncompacted:
+        if len(projects) == 1:
+            live_hits = live_memory.search_live_entries(uncompacted, project_identity=projects[0])
+        elif exact_match is not None:
+            live_hits = live_memory.search_live_entries(uncompacted, project_identity=exact_match)
+        else:
+            live_hits = live_memory.search_live_entries(uncompacted, terms=terms)
     return {
         "query": project_query,
         "matched_projects": [p["project"] for p in projects],
         "matched_identities": projects,
         "total_matches": len(entries),
         "entries": sliced,
+        "live": live_hits[:10],
         "raw": raw_details,
     }
 
@@ -717,12 +784,20 @@ def query_keyword(
 
     sliced = hits[:limit]
     raw_hits = raw_for_results(sliced, data_dir, machine_filter) if include_raw else []
+    archived = {str(d.get("workday", "")) for d in days}
+    uncompacted = live_memory.load_uncompacted_live(data_dir, archived_workdays=archived)
+    live_hits = (
+        live_memory.search_live_entries(uncompacted, terms=terms)
+        if uncompacted and not status_filter and not machine_filter
+        else []
+    )
 
     return {
         "query": keyword,
         "scope": scope,
         "total_matches": len(hits),
         "hits": sliced,
+        "live": live_hits[:10],
         "raw": raw_hits,
     }
 
@@ -902,6 +977,30 @@ def format_item_sources(item: dict[str, Any]) -> str:
     return f"  - 出处：{citations}"
 
 
+def format_live_section(live_items: list[dict[str, Any]]) -> list[str]:
+    if not live_items:
+        return []
+    lines = ["", "### 今日实时动态（未压实）"]
+    for item in live_items:
+        kind = item.get("kind")
+        wd = item.get("workday", "")
+        tm = item.get("time", "")
+        if kind == "live_note":
+            lines.append(f"- **`{wd} {tm}`** [今日笔记] **{item.get('project', '')}**：{item.get('text', '')}")
+        elif kind == "live_session":
+            ws = f" (`{item['workspace']}`)" if item.get("workspace") else ""
+            summary = item.get("summary") or item.get("last_input") or ""
+            lines.append(
+                f"- **`{wd} {tm}`** [今日实时 | {item.get('tool', '')}] **{item.get('title', '')}**{ws}"
+                + (f" — {summary}" if summary else "")
+            )
+        elif kind == "live_git":
+            lines.append(
+                f"- **`{wd} {tm}`** [今日 Git | {item.get('repo_name', '')}] `{item.get('hash', '')}` {item.get('subject', '')}"
+            )
+    return lines
+
+
 def format_project_query_md(res: dict[str, Any]) -> str:
     lines = [f"### 项目时间线：`{res['query']}`（匹配项目 {len(res['matched_projects'])} 个，共 {res['total_matches']} 条记录）"]
     if res["matched_projects"]:
@@ -913,9 +1012,11 @@ def format_project_query_md(res: dict[str, Any]) -> str:
             lines.append(f"> 别名：{'、'.join(project['aliases'])}")
         if project.get("paths"):
             lines.append(f"> 关键路径：{' ； '.join(f'`{p}`' for p in project['paths'])}")
+    lines.extend(format_live_section(res.get("live") or []))
     lines.append("")
     if not res["entries"]:
-        lines.append("_无匹配记录_")
+        if not res.get("live"):
+            lines.append("_无匹配记录_")
         return "\n".join(lines)
     for e in res["entries"]:
         scope_lbl = "工作" if e["scope"] == "work" else "个人"
@@ -939,7 +1040,7 @@ def format_keyword_query_md(res: dict[str, Any]) -> str:
         f"### 关键词检索：`{res['query']}`（scope={res['scope']}，共 {res['total_matches']} 条，展示 {len(res['hits'])} 条）",
         "",
     ]
-    if not res["hits"] and not res.get("raw"):
+    if not res["hits"] and not res.get("raw") and not res.get("live"):
         lines.append("_无匹配结果_")
         return "\n".join(lines)
     for h in res["hits"]:
@@ -954,6 +1055,7 @@ def format_keyword_query_md(res: dict[str, Any]) -> str:
             lines.append(f"  - 下一步：{h['next_step']}")
         if h["kind"] != "day_headline":
             lines.append(format_item_sources(h))
+    lines.extend(format_live_section(res.get("live") or []))
     lines.extend(format_raw_section(res.get("raw") or []))
     return "\n".join(lines)
 
@@ -1138,6 +1240,12 @@ def main() -> None:
                            help="Remove one or more paths from a project (PROJECT PATH ...).")
     decisions.add_argument("--set-paths", nargs="+", metavar="ARG",
                            help="Replace a project's registered paths (PROJECT [PATH ...]; omit PATH to clear).")
+    decisions.add_argument("--note", nargs=2, metavar=("PROJECT", "TEXT"),
+                           help="Record a real-time same-day note into the 0-token live WAL and refresh MEMORY_INDEX.md.")
+    decisions.add_argument("--live-sync", action="store_true",
+                           help="Run a 0-token incremental scan of today's 4 clients + Git and refresh MEMORY_INDEX.md.")
+    parser.add_argument("--note-path", nargs="+", metavar="PATH",
+                        help="Optional path(s) to register alongside --note.")
     parser.add_argument("--keyword", "-k", help="Search keyword(s) (space-separated AND terms) across history.")
     parser.add_argument("--date", help="Inspect a specific workday (YYYY-MM-DD).")
     parser.add_argument("--days", type=int, help="Limit search to the most recent N calendar days.")
@@ -1185,6 +1293,54 @@ def main() -> None:
             print(
                 f"Synced local offline cache from {res['endpoint_name']} ({res['endpoint_url']}): "
                 f"{res['total_days']} days -> {res['index_path']}"
+            )
+        return
+
+    if args.note:
+        target_data_dir = args.data_dir or DEFAULT_DATA_DIR
+        days = load_all_days(target_data_dir)
+        try:
+            saved = live_memory.add_note(
+                target_data_dir,
+                days,
+                args.note[0],
+                args.note[1],
+                paths=args.note_path,
+                cfg=cfg,
+            )
+        except ValueError as exc:
+            parser.exit(2, f"ERROR: {exc}\n")
+        stats = generate_memory_index(
+            days,
+            output_path=args.index_output or resolve_index_path(cfg),
+            tz_name=str(cfg.get("timezone") or "Asia/Shanghai"),
+            catalog=ProjectCatalog(days, load_registry(target_data_dir)),
+            data_dir=target_data_dir,
+        )
+        if args.as_json:
+            print(json.dumps({"workday": saved["workday"], "note": saved["note"], "index": stats}, ensure_ascii=False, indent=2))
+        else:
+            n = saved["note"]
+            print(f"已记入今日实时动态 ({saved['workday']} {n['time']}) [{n['project']}]: {n['text']}")
+            print(f"已刷新 {stats['path']} ({stats['bytes']} bytes)")
+        return
+
+    if args.live_sync:
+        target_data_dir = args.data_dir or DEFAULT_DATA_DIR
+        res = live_memory.sync_live(
+            target_data_dir,
+            cfg=cfg,
+            force_scan=True,
+            rebuild_index=True,
+            index_output=args.index_output,
+        )
+        if args.as_json:
+            print(json.dumps(res, ensure_ascii=False, indent=2))
+        else:
+            print(
+                f"Live synced {res['workday']}: "
+                f"{res['notes_count']} notes, {res['sessions_count']} sessions, {res['git_count']} commits -> "
+                f"{(res.get('index') or {}).get('path', '')}"
             )
         return
 
@@ -1242,7 +1398,9 @@ def main() -> None:
     catalog = ProjectCatalog(days, load_registry(target_data_dir))
 
     if args.index:
-        print(render_memory_index(days, tz_name=str(cfg.get("timezone") or "Asia/Shanghai"), catalog=catalog))
+        archived = {str(d.get("workday", "")) for d in days}
+        live_days = live_memory.load_uncompacted_live(target_data_dir, archived_workdays=archived)
+        print(render_memory_index(days, tz_name=str(cfg.get("timezone") or "Asia/Shanghai"), catalog=catalog, live_days=live_days))
         return
 
     if args.rebuild_index:
@@ -1251,6 +1409,7 @@ def main() -> None:
             output_path=args.index_output or resolve_index_path(cfg),
             tz_name=str(cfg.get("timezone") or "Asia/Shanghai"),
             catalog=catalog,
+            data_dir=target_data_dir,
         )
         if args.as_json:
             print(json.dumps(stats, ensure_ascii=False, indent=2))

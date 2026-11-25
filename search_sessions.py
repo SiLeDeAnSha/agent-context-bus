@@ -2,13 +2,11 @@
 """Find verbatim excerpts in the AI clients' local session stores."""
 
 import argparse
-from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
 import heapq
 import json
 from pathlib import Path
 import re
-import sqlite3
 import sys
 from zoneinfo import ZoneInfo
 
@@ -24,7 +22,7 @@ from collect import (
 from query_memory import load_config
 
 
-CLIENTS = ("antigravity", "codex", "workbuddy", "t3")
+CLIENTS = ("antigravity", "codex", "workbuddy")
 MAX_EXCERPT = 800
 EARLIEST = datetime.min.replace(tzinfo=timezone.utc)
 
@@ -146,44 +144,6 @@ def jsonl_records(client, ids, errors):
             errors.append(f"{path}: {exc}")
 
 
-def t3_records(ids, errors):
-    path = Path.home() / ".t3/userdata/statev2.sqlite"
-    if not path.is_file():
-        return
-    thread_filter = "AND rec.thread_id IN (" + ",".join("?" for _ in ids) + ")" if ids else ""
-    try:
-        with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
-            records = db.execute(f"""
-                SELECT rec.thread_id, rec.message_id, rec.created_at, rec.role, rec.payload_json
-                FROM orchestration_v2_projection_messages AS rec
-                JOIN orchestration_v2_projection_threads AS t ON t.thread_id = rec.thread_id
-                WHERE t.deleted_at IS NULL AND rec.role IN ('user', 'assistant') {thread_filter}
-            """, tuple(ids))
-            for sid, row_id, timestamp, role, payload in records:
-                yield sid, path, row_id, parse_iso_dt(timestamp or ""), role, json_object(payload).get("text")
-
-            items = db.execute(f"""
-                SELECT rec.thread_id, rec.turn_item_id, rec.updated_at, rec.type, rec.payload_json
-                FROM orchestration_v2_projection_turn_items AS rec
-                JOIN orchestration_v2_projection_threads AS t ON t.thread_id = rec.thread_id
-                WHERE t.deleted_at IS NULL AND rec.type IN ('command_execution', 'dynamic_tool', 'error')
-                    {thread_filter}
-            """, tuple(ids))
-            for sid, row_id, timestamp, kind, payload in items:
-                event = json_object(payload)
-                dt = parse_iso_dt(event.get("startedAt") or timestamp or "")
-                if kind == "error":
-                    yield sid, path, row_id, dt, "error", event.get("failure")
-                else:
-                    arguments = event.get("input")
-                    if kind == "dynamic_tool":
-                        arguments = tool_arguments(arguments)
-                    yield sid, path, row_id, dt, "tool_call", arguments
-                    yield sid, path, row_id, dt, "tool_output", event.get("output")
-    except sqlite3.Error as exc:
-        errors.append(f"{path}: {exc}")
-
-
 def excerpts(text, pattern):
     last_end = 0
     for match in pattern.finditer(text):
@@ -206,7 +166,7 @@ def excerpts(text, pattern):
 
 def find_matches(clients, ids, pattern, start, end, tz, day_start, errors):
     for client in clients:
-        records = t3_records(ids, errors) if client == "t3" else jsonl_records(client, ids, errors)
+        records = jsonl_records(client, ids, errors)
         for sid, path, position, dt, kind, value in records:
             if start and (dt is None or dt < start):
                 continue

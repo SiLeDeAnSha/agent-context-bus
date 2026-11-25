@@ -25,7 +25,6 @@ CLIENTS = {
     "antigravity": "Antigravity",
     "codex": "Codex",
     "workbuddy": "WorkBuddy",
-    "t3": "T3 Code",
 }
 DEFAULT_OUTPUT = Path(collect.BASE_DIR) / "data" / "first-import"
 
@@ -39,24 +38,6 @@ def has_readable_log(paths: Iterable[str]) -> bool:
         except OSError:
             continue
     return False
-
-
-def has_readable_t3() -> bool:
-    path = os.path.expanduser(collect.T3_DB)
-    if not os.path.isfile(path):
-        return False
-    required_tables = {
-        "projection_projects",
-        "orchestration_v2_projection_threads",
-        "orchestration_v2_projection_provider_threads",
-        "orchestration_v2_projection_messages",
-    }
-    try:
-        with closing(collect.open_session_db(path)) as conn:
-            tables = {name for (name,) in conn.execute("SELECT name FROM sqlite_master")}
-            return required_tables <= tables
-    except (OSError, sqlite3.Error):
-        return False
 
 
 def choose_clients(available: dict[str, bool], start: date, end: date) -> set[str]:
@@ -115,7 +96,6 @@ def import_week(output: Path) -> int:
         "antigravity": has_readable_log(collect.list_antigravity_transcript_paths()),
         "codex": has_readable_log(codex_paths),
         "workbuddy": has_readable_log(workbuddy_paths[sid] for sid in workbuddy_meta.keys() & workbuddy_paths.keys()),
-        "t3": has_readable_t3(),
     }
     selected = choose_clients(available, start, end)
     if not any(available.values()):

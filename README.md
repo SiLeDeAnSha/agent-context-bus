@@ -1,8 +1,8 @@
 # 跨端 AI 记忆中枢 · Agent Context Bus
 
-> 本地优先的跨 Agent 记忆层与项目上下文总线（原「日迹 · Daily Summary」），统一打通 **Antigravity / Codex / WorkBuddy / T3 Code / Claude Code** 的历史进度、物理路径与原始会话溯源。
+> 本地优先的跨 Agent 记忆层与项目上下文总线（原「日迹 · Daily Summary」），统一打通 **Antigravity / Codex / WorkBuddy / Claude Code** 的历史进度、物理路径与原始会话溯源。
 
-自动采集本地 **Antigravity / Codex / WorkBuddy / T3 Code** 多端工作轨迹（其中 T3 Code 通过 `statev2.sqlite` 按实际 Provider 自动归口并与 Codex 去重），沉淀四层渐进式检索记忆（L0 全局规则入口 → L1 `MEMORY_INDEX.md` 全项目快照 → L2 `query_memory.py` 结构化时间线与项目路径注册表 → L3 `search_sessions.py` 原始会话全文溯源），并支持定时任务触发，**严格分离为两份独立 Excel 总表**：
+自动采集本地 **Antigravity / Codex / WorkBuddy** 多端工作轨迹，沉淀四层渐进式检索记忆（L0 全局规则入口 → L1 `MEMORY_INDEX.md` 全项目快照 → L2 `query_memory.py` 结构化时间线与项目路径注册表 → L3 `search_sessions.py` 原始会话全文溯源），并支持定时任务触发，**严格分离为两份独立 Excel 总表**：
 
 1. **正式工作表**：`~/Documents/DailyReport/每日工作汇总.xlsx`（3 个 Sheet：`每日概览`、`项目总览`、`项目流程明细`）
    - 收录正式业务工作（公文材料、海报排版、内容统计、视频制作等）。
@@ -11,7 +11,7 @@
 
 ## 首次导入并查项目
 
-在仓库目录运行 `python3 onboarding.py`（Windows PowerShell 用 `python onboarding.py`）。向导会检查本机的 Antigravity、Codex、WorkBuddy 和 T3 Code 会话来源。按回车导入全部可读客户端，或输入编号选择。导入范围是最近 7 天，含当前工作日，日期按配置的时区和工作日切换时间计算。
+在仓库目录运行 `python3 onboarding.py`（Windows PowerShell 用 `python onboarding.py`）。向导会检查本机的 Antigravity、Codex 和 WorkBuddy 会话来源。按回车导入全部可读客户端，或输入编号选择。导入范围是最近 7 天，含当前工作日，日期按配置的时区和工作日切换时间计算。
 
 导入后，终端会展示真实项目的一条会话记录及出处，并给出可直接复制的 `query_memory.py --project` 命令。项目名优先取客户端目录或工作区，缺少这些信息时使用会话标题。同一次导入碰到同名的不同工作区时，会附上完整路径和机器标识。把命令中的 `--project` 和其值换成 `--projects`，即可浏览这次导入的全部项目。
 
@@ -36,7 +36,7 @@
 
 汇总 JSON 的每条进展可提交 `sources`，写入时根据该工作日的原始记录校验，并从原始记录补齐工作目录和提交涉及的文件。「项目流程明细」的「出处」列和项目、关键词、日期查询都会显示已保存的引用。缺少可核验引用的记录显示「来源待核对」。
 
-- 会话引用需要 `{"kind":"session","id":"原会话 ID","bucket":"codex","machine":"机器 ID"}`。`bucket` 对应原始记录的数组名（`antigravity`、`codex`、`workbuddy` 或 `t3_other`）。
+- 会话引用需要 `{"kind":"session","id":"原会话 ID","bucket":"codex","machine":"机器 ID"}`。`bucket` 对应原始记录的数组名（`antigravity`、`codex` 或 `workbuddy`）。
 - Git 引用需要 `{"kind":"commit","id":"原始记录的 hash","repo":"仓库路径","machine":"机器 ID"}`。
 - 文件引用需要 `{"kind":"file","id":"原始记录 paths 中的完整路径","machine":"机器 ID"}`。
 
@@ -51,7 +51,7 @@ python3 search_sessions.py --keyword '报错中的一段原文' --session-id '<�
 python3 search_sessions.py --keyword 'ffprobe' --client codex --date 2026-11-24 --limit 3
 ```
 
-按字面匹配关键词，忽略大小写。默认只返回最近 5 个命中片段，附会话 ID、时间和原文件位置。可用 `--from`、`--to` 限定工作日范围，或用 `--json` 输出结构化结果。检索覆盖本机 Antigravity 完整转录、Codex 活跃及归档会话、WorkBuddy 项目日志和 T3 Code 会话数据库中的消息、命令与工具输出。Codex 的 `.zst` 归档需要 Python 3.14+ 或 Python 的 `zstandard` 包。
+按字面匹配关键词，忽略大小写。默认只返回最近 5 个命中片段，附会话 ID、时间和原文件位置。可用 `--from`、`--to` 限定工作日范围，或用 `--json` 输出结构化结果。检索覆盖本机 Antigravity 完整转录、Codex 活跃及归档会话和 WorkBuddy 项目日志中的消息、命令与工具输出。Codex 的 `.zst` 归档需要 Python 3.14+ 或 Python 的 `zstandard` 包。
 
 ## 项目身份、别名、物理路径和纠错
 
@@ -77,6 +77,27 @@ python3 query_memory.py --set-paths '代理分流规则优化' '~/projects/proxy
 - 拆分可把一个别名恢复为独立项目，也可用 `--split-project '新项目主名称' '已合并的别名 A' '已合并的别名 B'` 将多个别名转到指定项目。拆出的名称会独立归档，包括之前和以后以该名称记录的进展。对尚未合并的候选名称执行拆分，会将其确认为独立项目。
 - 人工决定与 `paths` 保存在 `data/project_registry.json`。配置 NAS 时，查询、路径登记与纠错均走 NAS 登记表（写操作需写权限）。本地模式用 `--local` 或 `--data-dir`。用 `--sync-cache` 更新离线副本。
 - 查询立即应用新决定。本地已生成的 `MEMORY_INDEX.md` 随下次日报写入刷新，也可运行 `--rebuild-index` 刷新。Excel 继续展示每条进展的原始项目名称。
+
+## 当日 0 Token 实时层与官方 `Stop` 钩子（WAL + Compaction）
+
+为消除“必须等次日汇总才能跨端看见刚干完的事”的延迟，系统在每日压实之前引入了一层 **0 额外 LLM Token 的实时增量层（`data/live/live_<YYYY-MM-DD>.json`）**：
+
+- **事件驱动自动写入（不阻塞主对话）**：通过 Antigravity（`~/.gemini/config/hooks.json`）与 Codex（`~/.codex/hooks.json`）官方 `Stop` 钩子调用 `hook_bridge.py`，`<50ms` 内后台脱钩拉起 `live_memory.py`（带 12 秒防抖与文件锁），自动复用 Antigravity `conversation_summaries.db` 与 Codex `memories/rollout_summaries/` 官方摘要，并顺手增量扫当天 WorkBuddy 与 Git 提交，刷新 `MEMORY_INDEX.md` 顶部「今日实时动态」区。
+- **零上下文注入**：默认只开 `Stop` 单向写入，不开 `SessionStart` 强注入，不污染闲聊上下文、不增加读取 Token。
+- **手动/Agent 主动记一笔**：随时执行 `query_memory.py --note "<项目名>" "<关键结论>"`（可选 `--note-path` 同时登记路径），秒级入库并刷新 `MEMORY_INDEX.md`；`--project` 与 `--keyword` 查询会自动融合未压实的今日动态。
+- **每日压实自动退出**：当次日汇总通过 `write_excel.py` 归档该工作日后，该日实时动态自动从 `MEMORY_INDEX.md` 顶部退出，同时手动 `--note` 会随 `collect.py` 透传给每日汇总，保证 `MEMORY_INDEX.md` 长期稳定在 ~20 KB。
+
+```bash
+# 一键幂等装配四端规则、Skill 软链与 Antigravity/Codex Stop 钩子
+python3 skills/daily-memory/scripts/sync_global_rules.py --sync-skills --sync-hooks
+
+# 随时一键关闭钩子（秒级回退）
+python3 skills/daily-memory/scripts/sync_global_rules.py --disable-hooks
+
+# 手动记一笔今日关键结论 / 强制刷新实时层
+python3 query_memory.py --note 'Agent Context Bus' '上线 Stop Hook 0-Token 实时层'
+python3 query_memory.py --live-sync
+```
 
 ## 目录与脚本
 

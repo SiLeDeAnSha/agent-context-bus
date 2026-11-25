@@ -79,7 +79,7 @@ python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --probe
 - 断网自动降级：`query_memory.py` 在全部远程线路不可达时会自动回退到 `~/.daily-memory/cache/` 本地离线缓存。
 
 ### 公司 / 临时电脑（30 秒只读接入，零数据残留）
-- 仅配 `READ_TOKEN`，直接把 `deploy/mcp_client_examples.json` 加入 Antigravity / Claude Code / Codex / WorkBuddy / T3 Code 的 MCP 配置：
+- 仅配 `READ_TOKEN`，直接把 `deploy/mcp_client_examples.json` 加入 Antigravity / Claude Code / Codex / WorkBuddy 的 MCP 配置：
   - URL：`https://mem.yourdomain.com/mcp`
   - Header：`Authorization: Bearer <DAILY_MEMORY_READ_TOKEN>`
 - 暴露 5 个只读工具：`memory_get_index`、`memory_list_projects`、`memory_query`、`memory_get_raw_day`、`memory_server_status`。

@@ -602,7 +602,6 @@ def style_sheet(ws: Any, sheet_name: str, rows: list[list[Any]], theme_key: str)
         "Antigravity": PatternFill(start_color="DBEAFE", end_color="DBEAFE", fill_type="solid"),
         "Codex": PatternFill(start_color="DCFCE7", end_color="DCFCE7", fill_type="solid"),
         "WorkBuddy": PatternFill(start_color="EDE9FE", end_color="EDE9FE", fill_type="solid"),
-        "T3 Code": PatternFill(start_color="CFFAFE", end_color="CFFAFE", fill_type="solid"),
         "Claude": PatternFill(start_color="FFEDD5", end_color="FFEDD5", fill_type="solid"),
         "Cursor": PatternFill(start_color="E0E7FF", end_color="E0E7FF", fill_type="solid"),
         "Grok": PatternFill(start_color="F1F5F9", end_color="F1F5F9", fill_type="solid"),
@@ -619,7 +618,6 @@ def style_sheet(ws: Any, sheet_name: str, rows: list[list[Any]], theme_key: str)
         "Antigravity": Font(name="PingFang SC", size=10, bold=True, color="1E40AF"),
         "Codex": Font(name="PingFang SC", size=10, bold=True, color="166534"),
         "WorkBuddy": Font(name="PingFang SC", size=10, bold=True, color="6D28D9"),
-        "T3 Code": Font(name="PingFang SC", size=10, bold=True, color="155E75"),
         "Claude": Font(name="PingFang SC", size=10, bold=True, color="9A3412"),
         "Cursor": Font(name="PingFang SC", size=10, bold=True, color="3730A3"),
         "Grok": Font(name="PingFang SC", size=10, bold=True, color="334155"),
@@ -960,6 +958,7 @@ def main() -> None:
                 output_path=query_memory.resolve_index_path(cfg),
                 tz_name=str(cfg.get("timezone") or "Asia/Shanghai"),
                 catalog=ProjectCatalog(history, load_registry(target_data_dir)),
+                data_dir=target_data_dir,
             )
             print(f"Updated memory index: {mem_res}")
 

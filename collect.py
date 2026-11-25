@@ -51,7 +51,6 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 DATA_DIR = os.path.join(BASE_DIR, "data")
 ANTIGRAVITY_DB = "~/.gemini/antigravity/conversation_summaries.db"
-T3_DB = "~/.t3/userdata/statev2.sqlite"
 
 
 EXAMPLE_CONFIG_PATH = os.path.join(BASE_DIR, "config.example.json")
@@ -814,278 +813,6 @@ def collect_workbuddy(
     return results, all_ts
 
 
-def clean_t3_user_text(raw: str) -> str:
-    if not raw:
-        return ""
-    s = re.sub(r"<t3_code_instructions>.*?</t3_code_instructions>", "", raw, flags=re.DOTALL)
-    m = re.search(r"<user_request>\s*(.*?)\s*</user_request>", s, flags=re.DOTALL)
-    if m:
-        s = m.group(1)
-    return re.sub(r"\s+", " ", s).strip()
-
-
-def map_t3_provider_bucket(provider: str, instance_id: str) -> tuple[str, str]:
-    """Return (bucket, display_tool) for a T3 Code thread provider."""
-    p = (instance_id or provider or "").strip()
-    pl = p.lower()
-    if "antigravity" in pl:
-        return "antigravity", "Antigravity"
-    if "codex" in pl:
-        return "codex", "Codex"
-    if "codebuddy" in pl or "workbuddy" in pl:
-        return "workbuddy", "WorkBuddy"
-    if "claude" in pl:
-        return "other", "Claude"
-    if "cursor" in pl:
-        return "other", "Cursor"
-    if "grok" in pl:
-        return "other", "Grok"
-    if "opencode" in pl:
-        return "other", "OpenCode"
-    return "other", "T3 Code"
-
-
-def load_t3_code_data(
-    db_path: str | None = None,
-) -> tuple[dict[str, dict[str, str]], dict[str, dict[str, Any]], dict[str, set[str]], list[tuple[str, str, str, str]]]:
-    """Read T3 Code statev2.sqlite projects, top-level threads, provider session IDs, and messages."""
-    path = os.path.expanduser(db_path or T3_DB)
-    if not os.path.exists(path):
-        return {}, {}, {}, []
-
-    projects: dict[str, dict[str, str]] = {}
-    threads: dict[str, dict[str, Any]] = {}
-    provider_sids: dict[str, set[str]] = defaultdict(set)
-    messages: list[tuple[str, str, str, str]] = []
-
-    conn = None
-    try:
-        conn = open_session_db(path)
-        for pid, title, ws_root in conn.execute(
-            "SELECT project_id, title, workspace_root FROM projection_projects"
-        ):
-            projects[str(pid)] = {
-                "title": str(title or "").strip(),
-                "workspace_root": str(ws_root or "").strip(),
-            }
-
-        for tid, pid, title, def_prov, inst_id, archived_at, deleted_at, payload_raw in conn.execute(
-            """
-            SELECT thread_id, project_id, title, default_provider, provider_instance_id,
-                   archived_at, deleted_at, payload_json
-            FROM orchestration_v2_projection_threads
-            """
-        ):
-            tid_s = str(tid or "")
-            if deleted_at is not None or tid_s.startswith("thread:subagent:"):
-                continue
-            try:
-                p_obj = json.loads(payload_raw) if payload_raw else {}
-            except json.JSONDecodeError:
-                p_obj = {}
-            lineage = p_obj.get("lineage") or {}
-            if lineage.get("relationshipToParent") == "subagent":
-                continue
-            threads[tid_s] = {
-                "thread_id": tid_s,
-                "project_id": str(pid or ""),
-                "title": str(title or "").strip(),
-                "default_provider": str(def_prov or "").strip(),
-                "provider_instance_id": str(inst_id or p_obj.get("providerInstanceId") or "").strip(),
-                "archived": archived_at is not None,
-                "creation_source": str(p_obj.get("creationSource") or ""),
-            }
-
-        for tid, prov_sid in conn.execute(
-            "SELECT thread_id, provider_session_id FROM orchestration_v2_projection_provider_threads WHERE thread_id IS NOT NULL AND provider_session_id IS NOT NULL"
-        ):
-            if prov_sid:
-                provider_sids[str(tid)].add(str(prov_sid))
-
-        messages = conn.execute(
-            """
-            SELECT thread_id, role, created_at, payload_json
-            FROM orchestration_v2_projection_messages
-            ORDER BY created_at ASC
-            """
-        ).fetchall()
-    except Exception:
-        return {}, {}, {}, []
-    finally:
-        if conn is not None:
-            conn.close()
-
-    return projects, threads, provider_sids, messages
-
-
-def build_t3_record(
-    tid: str,
-    tinfo: dict[str, Any],
-    proj_info: dict[str, str],
-    bucket: str,
-    tool_label: str,
-    ts: list[datetime],
-    prompts: list[str],
-    replies: list[str],
-    tz: ZoneInfo,
-    workday: str,
-    gap_min: int,
-) -> dict[str, Any]:
-    raw_title = tinfo.get("title") or prompts[0][:60]
-    proj_title = proj_info.get("title", "")
-    ws_root = proj_info.get("workspace_root", "")
-
-    if bucket == "workbuddy":
-        tag = f"T3·Codebuddy/{proj_title}" if proj_title else "T3·Codebuddy"
-    else:
-        tag = f"T3·{proj_title}" if proj_title else "T3"
-    display_title = f"{raw_title} [{tag}]"
-
-    rec: dict[str, Any] = {
-        "source": tool_label,
-        "client": "T3 Code",
-        "id": tid,
-        "archived": bool(tinfo.get("archived")),
-        "title": raw_title,
-        "folder": proj_title,
-        "display_title": display_title,
-        "workspace": ws_root,
-        "cwd": ws_root,
-        "turn_count": len(prompts),
-        "active_span": format_span(ts, tz, workday),
-        "estimated_hours": estimate_active_hours(ts, gap_min),
-        "user_prompts": compress_turn_history(prompts),
-        "assistant_milestones": sample_assistant_milestones(replies),
-        "last_assistant_reply": replies[-1] if replies else "",
-    }
-    if bucket == "codex":
-        rec["title"] = display_title
-    return rec
-
-
-def collect_t3_code(
-    start_dt: datetime,
-    end_dt: datetime,
-    tz: ZoneInfo,
-    workday: str,
-    cfg: dict[str, Any],
-    existing_codex_ids: set[str] | None = None,
-    db_path: str | None = None,
-) -> tuple[
-    list[dict[str, Any]],
-    list[datetime],
-    list[dict[str, Any]],
-    list[datetime],
-    list[dict[str, Any]],
-    list[datetime],
-    list[dict[str, Any]],
-    list[datetime],
-    dict[str, str],
-]:
-    """Collect active T3 Code threads for one workday, routed by provider and deduplicated against Codex."""
-    markers = cfg.get("self_filter_markers", [])
-    gap_min = int(cfg["merge_gap_minutes"])
-    codex_seen = existing_codex_ids or set()
-
-    projects, threads, provider_sids, messages = load_t3_code_data(db_path=db_path)
-    if not threads:
-        return [], [], [], [], [], [], [], [], {}
-
-    steps_by_t: dict[str, list[datetime]] = defaultdict(list)
-    prompts_by_t: dict[str, list[str]] = defaultdict(list)
-    replies_by_t: dict[str, list[str]] = defaultdict(list)
-    self_threads: set[str] = set()
-
-    for tid, role, created_at, payload_raw in messages:
-        tid_s = str(tid or "")
-        if tid_s not in threads or tid_s in self_threads:
-            continue
-        dt = parse_iso_dt(str(created_at or ""))
-        if not dt or not (start_dt <= dt < end_dt):
-            continue
-        try:
-            p_obj = json.loads(payload_raw) if payload_raw else {}
-        except json.JSONDecodeError:
-            continue
-        raw_text = str(p_obj.get("text") or "")
-        if role == "user":
-            if any(m in raw_text for m in markers):
-                self_threads.add(tid_s)
-                continue
-            # Exclude agent-to-agent MCP handoffs or subagent system prompts; keep real human inputs.
-            created_by = str(p_obj.get("createdBy") or "")
-            creation_src = str(p_obj.get("creationSource") or "")
-            if created_by and created_by != "user":
-                continue
-            if not created_by and creation_src in ("mcp", "provider"):
-                continue
-            cleaned = clean_t3_user_text(raw_text)
-            if cleaned:
-                prompts_by_t[tid_s].append(cleaned[:300])
-                steps_by_t[tid_s].append(dt)
-        elif role == "assistant":
-            cleaned = re.sub(r"\s+", " ", raw_text).strip()
-            if cleaned:
-                replies_by_t[tid_s].append(cleaned[:300])
-                steps_by_t[tid_s].append(dt)
-
-    ag_items: list[dict[str, Any]] = []
-    ag_ts: list[datetime] = []
-    cx_items: list[dict[str, Any]] = []
-    cx_ts: list[datetime] = []
-    wb_items: list[dict[str, Any]] = []
-    wb_ts: list[datetime] = []
-    other_items: list[dict[str, Any]] = []
-    other_ts: list[datetime] = []
-    codex_title_hints: dict[str, str] = {}
-
-    for tid, tinfo in threads.items():
-        if tid in self_threads:
-            continue
-        if any(m in tinfo.get("title", "") for m in markers):
-            continue
-        prompts = prompts_by_t.get(tid, [])
-        ts = steps_by_t.get(tid, [])
-        if not prompts or not ts:
-            continue
-
-        proj_info = projects.get(tinfo.get("project_id", ""), {})
-        bucket, tool_label = map_t3_provider_bucket(
-            tinfo.get("default_provider", ""), tinfo.get("provider_instance_id", "")
-        )
-
-        if bucket == "codex":
-            matched_sids = provider_sids.get(tid, set()) & codex_seen
-            if matched_sids:
-                proj_title = proj_info.get("title", "")
-                hint_title = tinfo.get("title", "")
-                if hint_title:
-                    full_hint = f"{hint_title} [T3·{proj_title}]" if proj_title else f"{hint_title} [T3]"
-                    for sid in matched_sids:
-                        codex_title_hints[sid] = full_hint
-                continue
-
-        rec = build_t3_record(
-            tid, tinfo, proj_info, bucket, tool_label, ts, prompts, replies_by_t.get(tid, []), tz, workday, gap_min
-        )
-        if bucket == "antigravity":
-            ag_items.append(rec)
-            ag_ts.extend(ts)
-        elif bucket == "codex":
-            cx_items.append(rec)
-            cx_ts.extend(ts)
-        elif bucket == "workbuddy":
-            wb_items.append(rec)
-            wb_ts.extend(ts)
-        else:
-            other_items.append(rec)
-            other_ts.extend(ts)
-
-    for lst in (ag_items, cx_items, wb_items, other_items):
-        lst.sort(key=lambda x: x["active_span"])
-    return ag_items, ag_ts, cx_items, cx_ts, wb_items, wb_ts, other_items, other_ts, codex_title_hints
-
-
 def discover_git_repos(cfg: dict[str, Any]) -> list[str]:
     excludes = [os.path.realpath(os.path.expanduser(p)) for p in cfg.get("exclude_paths", [])]
     exclude_names = set(cfg.get("exclude_dir_names", []))
@@ -1336,43 +1063,31 @@ def build_day_payload(
     start_dt, end_dt = workday_bounds(workday, tz_name, int(cfg["day_start_hour"]))
     mid = multi_machine.normalize_machine_id(machine_id or cfg.get("machine_id"))
 
-    clients = session_clients if session_clients is not None else {"antigravity", "codex", "workbuddy", "t3"}
+    clients = session_clients if session_clients is not None else {"antigravity", "codex", "workbuddy"}
     args = (start_dt, end_dt, tz, workday, cfg)
     ag_items, ag_ts = ([], [])
     codex_items, codex_ts = ([], [])
     wb_items, wb_ts = ([], [])
-    t3_other, t3_other_ts = ([], [])
     if "antigravity" in clients:
         ag_items, ag_ts = collect_antigravity(*args, allow_missing_metadata=session_clients is not None)
     if "codex" in clients:
         codex_items, codex_ts = collect_codex(*args, paths=codex_paths)
     if "workbuddy" in clients:
         wb_items, wb_ts = collect_workbuddy(*args)
-    if "t3" in clients:
-        existing_codex_ids = {str(it["id"]) for it in codex_items if it.get("id")}
-        t3_ag, t3_ag_ts, t3_cx, t3_cx_ts, t3_wb, t3_wb_ts, t3_other, t3_other_ts, cx_hints = collect_t3_code(
-            *args, existing_codex_ids=existing_codex_ids
-        )
-        for it in codex_items:
-            sid = str(it.get("id") or "")
-            if sid in cx_hints:
-                it["title"] = cx_hints[sid]
-                it["client"] = "T3 Code"
 
-        ag_items = sorted(ag_items + t3_ag, key=lambda x: x["active_span"])
-        codex_items = sorted(codex_items + t3_cx, key=lambda x: x["active_span"])
-        wb_items = sorted(wb_items + t3_wb, key=lambda x: x["active_span"])
-        ag_ts += t3_ag_ts
-        codex_ts += t3_cx_ts
-        wb_ts += t3_wb_ts
-
-    git_items, git_ts, file_groups, existing_projects = [], [], [], []
+    git_items, git_ts, file_groups, existing_projects, live_notes = [], [], [], [], []
     if session_clients is None:
         git_items, git_ts = collect_git(start_dt, end_dt, tz, cfg)
         file_groups = collect_local_files(start_dt, end_dt, tz, cfg)
         existing_projects = load_existing_projects(cfg)
+        try:
+            import live_memory
 
-    all_ts = ag_ts + codex_ts + wb_ts + t3_other_ts + git_ts
+            live_notes = live_memory.load_live_day(DATA_DIR, workday).get("notes") or []
+        except Exception:
+            live_notes = []
+
+    all_ts = ag_ts + codex_ts + wb_ts + git_ts
     gap_min = int(cfg["merge_gap_minutes"])
     weekday_cn = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][
         datetime.strptime(workday, "%Y-%m-%d").weekday()
@@ -1388,20 +1103,18 @@ def build_day_payload(
         "antigravity_hours": estimate_active_hours(ag_ts, gap_min),
         "codex_hours": estimate_active_hours(codex_ts, gap_min),
         "workbuddy_hours": estimate_active_hours(wb_ts, gap_min),
-        "t3_other_hours": estimate_active_hours(t3_other_ts, gap_min),
         "existing_projects": existing_projects,
+        "live_notes": live_notes,
         "counts": {
             "antigravity_sessions": len(ag_items),
             "codex_sessions": len(codex_items),
             "workbuddy_sessions": len(wb_items),
-            "t3_other_sessions": len(t3_other),
             "git_repos": len(git_items),
             "file_groups": len(file_groups),
         },
         "antigravity": multi_machine.tag_items_with_machine(ag_items, mid),
         "codex": multi_machine.tag_items_with_machine(codex_items, mid),
         "workbuddy": multi_machine.tag_items_with_machine(wb_items, mid),
-        "t3_other": multi_machine.tag_items_with_machine(t3_other, mid),
         "git": multi_machine.tag_items_with_machine(git_items, mid),
         "files": multi_machine.tag_items_with_machine(file_groups, mid),
     }
@@ -1656,104 +1369,15 @@ def collect_all_history_single_pass(cfg: dict[str, Any], end_workday: str) -> li
                 build_workbuddy_record(sid, info, ts, prompts, replies_day[wd], tz, wd, gap_min)
             )
 
-    t3_other_by_day: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    t3_other_ts_by_day: dict[str, list[datetime]] = defaultdict(list)
-    t3_projects, t3_threads, t3_prov_sids, t3_messages = load_t3_code_data()
-    if t3_threads:
-        t3_steps: dict[tuple[str, str], list[datetime]] = defaultdict(list)
-        t3_prompts: dict[tuple[str, str], list[str]] = defaultdict(list)
-        t3_replies: dict[tuple[str, str], list[str]] = defaultdict(list)
-        t3_self: set[str] = set()
-        for tid, role, created_at, payload_raw in t3_messages:
-            tid_s = str(tid or "")
-            if tid_s not in t3_threads or tid_s in t3_self:
-                continue
-            dt = parse_iso_dt(str(created_at or ""))
-            if not dt:
-                continue
-            wd = dt_to_workday(dt)
-            if wd > end_workday:
-                continue
-            try:
-                p_obj = json.loads(payload_raw) if payload_raw else {}
-            except json.JSONDecodeError:
-                continue
-            raw_text = str(p_obj.get("text") or "")
-            if role == "user":
-                if any(m in raw_text for m in markers):
-                    t3_self.add(tid_s)
-                    continue
-                created_by = str(p_obj.get("createdBy") or "")
-                creation_src = str(p_obj.get("creationSource") or "")
-                if created_by and created_by != "user":
-                    continue
-                if not created_by and creation_src in ("mcp", "provider"):
-                    continue
-                cleaned = clean_t3_user_text(raw_text)
-                if cleaned:
-                    t3_prompts[(tid_s, wd)].append(cleaned[:300])
-                    t3_steps[(tid_s, wd)].append(dt)
-            elif role == "assistant":
-                cleaned = re.sub(r"\s+", " ", raw_text).strip()
-                if cleaned:
-                    t3_replies[(tid_s, wd)].append(cleaned[:300])
-                    t3_steps[(tid_s, wd)].append(dt)
-
-        cx_ids_by_day: dict[str, set[str]] = {
-            wd: {str(it.get("id") or "") for it in items if it.get("id")}
-            for wd, items in cx_by_day.items()
-        }
-        for (tid_s, wd), ts in sorted(t3_steps.items()):
-            if tid_s in t3_self:
-                continue
-            tinfo = t3_threads[tid_s]
-            if any(m in tinfo.get("title", "") for m in markers):
-                continue
-            prompts = t3_prompts.get((tid_s, wd), [])
-            if not prompts or not ts:
-                continue
-            proj_info = t3_projects.get(tinfo.get("project_id", ""), {})
-            bucket, tool_label = map_t3_provider_bucket(
-                tinfo.get("default_provider", ""), tinfo.get("provider_instance_id", "")
-            )
-            if bucket == "codex":
-                matched_sids = t3_prov_sids.get(tid_s, set()) & cx_ids_by_day.get(wd, set())
-                if matched_sids:
-                    proj_title = proj_info.get("title", "")
-                    hint_title = tinfo.get("title", "")
-                    if hint_title:
-                        full_hint = f"{hint_title} [T3·{proj_title}]" if proj_title else f"{hint_title} [T3]"
-                        for it in cx_by_day[wd]:
-                            if str(it.get("id") or "") in matched_sids:
-                                it["title"] = full_hint
-                                it["client"] = "T3 Code"
-                    continue
-            rec = build_t3_record(
-                tid_s, tinfo, proj_info, bucket, tool_label, ts, prompts, t3_replies.get((tid_s, wd), []), tz, wd, gap_min
-            )
-            if bucket == "antigravity":
-                ag_by_day[wd].append(rec)
-                ag_ts_by_day[wd].extend(ts)
-            elif bucket == "codex":
-                cx_by_day[wd].append(rec)
-                cx_ts_by_day[wd].extend(ts)
-            elif bucket == "workbuddy":
-                wb_by_day[wd].append(rec)
-                wb_ts_by_day[wd].extend(ts)
-            else:
-                t3_other_by_day[wd].append(rec)
-                t3_other_ts_by_day[wd].extend(ts)
-
     existing_projects = load_existing_projects(cfg)
     active_dates = sorted(
-        set(ag_by_day.keys()) | set(cx_by_day.keys()) | set(wb_by_day.keys()) | set(t3_other_by_day.keys())
+        set(ag_by_day.keys()) | set(cx_by_day.keys()) | set(wb_by_day.keys())
     )
     for wd in active_dates:
         ag_items = sorted(ag_by_day[wd], key=lambda x: x["active_span"])
         cx_items = sorted(cx_by_day[wd], key=lambda x: x["active_span"])
         wb_items = sorted(wb_by_day[wd], key=lambda x: x["active_span"])
-        t3o_items = sorted(t3_other_by_day[wd], key=lambda x: x["active_span"])
-        all_ts = ag_ts_by_day[wd] + cx_ts_by_day[wd] + wb_ts_by_day[wd] + t3_other_ts_by_day[wd]
+        all_ts = ag_ts_by_day[wd] + cx_ts_by_day[wd] + wb_ts_by_day[wd]
         start_dt, end_dt = workday_bounds(wd, tz_name, day_start_hour)
         weekday_cn = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][
             datetime.strptime(wd, "%Y-%m-%d").weekday()
@@ -1767,20 +1391,17 @@ def collect_all_history_single_pass(cfg: dict[str, Any], end_workday: str) -> li
             "antigravity_hours": estimate_active_hours(ag_ts_by_day[wd], gap_min),
             "codex_hours": estimate_active_hours(cx_ts_by_day[wd], gap_min),
             "workbuddy_hours": estimate_active_hours(wb_ts_by_day[wd], gap_min),
-            "t3_other_hours": estimate_active_hours(t3_other_ts_by_day[wd], gap_min),
             "existing_projects": existing_projects,
             "counts": {
                 "antigravity_sessions": len(ag_items),
                 "codex_sessions": len(cx_items),
                 "workbuddy_sessions": len(wb_items),
-                "t3_other_sessions": len(t3o_items),
                 "git_repos": 0,
                 "file_groups": 0,
             },
             "antigravity": ag_items,
             "codex": cx_items,
             "workbuddy": wb_items,
-            "t3_other": t3o_items,
             "git": [],
             "files": [],
         }
@@ -1881,15 +1502,13 @@ def main() -> None:
     for d in dates:
         p = collect_day(d, cfg, machine_id=machine_id)
         c = p["counts"]
-        t3o = c.get("t3_other_sessions", 0)
-        t3o_part = f", T3Other={t3o}" if t3o else ""
         push_part = ""
         if args.push and rc is not None:
             res, ep = remote_client.push_raw(rc, p, machine_id=machine_id)
             push_part = f" | PUSHED->{ep.name} (machines={','.join(res.get('machines', []))})"
         print(
             f"{d} ({p['weekday']}) [{machine_id}]: AG={c['antigravity_sessions']}, Codex={c['codex_sessions']}, "
-            f"WB={c.get('workbuddy_sessions', 0)}{t3o_part}, Git={c['git_repos']}, Files={c['file_groups']}, "
+            f"WB={c.get('workbuddy_sessions', 0)}, Git={c['git_repos']}, Files={c['file_groups']}, "
             f"Span={p['overall_active_span'] or '-'}, EstHours={p['overall_estimated_hours']}{push_part}"
         )
 

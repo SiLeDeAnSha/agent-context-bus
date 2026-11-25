@@ -108,7 +108,6 @@ class DailySummaryTests(unittest.TestCase):
                  patch.object(collect, "build_day_payload", side_effect=build_raw), \
                  patch.object(onboarding, "choose_clients", return_value={"codex"}), \
                  patch.object(onboarding, "has_readable_log", return_value=True), \
-                 patch.object(onboarding, "has_readable_t3", return_value=False), \
                  patch.object(collect, "list_codex_rollout_paths", return_value=[]), \
                  patch.object(collect, "load_workbuddy_metadata", return_value=({}, {})), \
                  redirect_stdout(io.StringIO()):
@@ -297,6 +296,177 @@ class DailySummaryTests(unittest.TestCase):
             projs = query_memory.query_projects(days, keyword="proxy-rules", catalog=catalog)
             self.assertEqual(len(projs), 1)
             self.assertEqual(projs[0]["paths"], ["~/projects/proxy-rules", "~/clash/script.js"])
+
+    def test_live_wal_hooks_compaction_and_bridge_safety(self) -> None:
+        import sqlite3
+        import subprocess
+        import sys
+        import hook_bridge
+        import live_memory
+
+        days = [
+            {
+                "workday": "2026-11-24",
+                "weekday": "周二",
+                "work_items": [
+                    {
+                        "scope": "personal",
+                        "project": "Agent Context Bus",
+                        "category": "效率工具开发",
+                        "tool": "Antigravity",
+                        "session_name": "记忆中枢开发",
+                        "summary": "历史汇总",
+                        "outputs": "query_memory.py",
+                        "status": "进行中",
+                        "next_step": "接入实时层",
+                    }
+                ],
+                "life_items": [],
+            }
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = os.path.join(tmpdir, "data")
+            os.makedirs(data_dir, exist_ok=True)
+            idx_path = os.path.join(tmpdir, "MEMORY_INDEX.md")
+
+            # Fake Antigravity sqlite DB (1 main conversation + 1 subagent to skip)
+            ag_db = os.path.join(tmpdir, "conversation_summaries.db")
+            conn = sqlite3.connect(ag_db)
+            conn.execute(
+                """
+                CREATE TABLE conversation_summaries (
+                    conversation_id TEXT PRIMARY KEY,
+                    title TEXT,
+                    preview TEXT,
+                    workspace_uris TEXT,
+                    last_modified_time TEXT,
+                    parent_conversation_id TEXT,
+                    nesting_depth INTEGER
+                )
+                """
+            )
+            now_iso = datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(timespec="seconds")
+            conn.execute(
+                "INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("conv-main", "实时层联调", "接入 Stop Hook 与实时动态", '["file:///tmp/demo"]', now_iso, "", 0),
+            )
+            conn.execute(
+                "INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("conv-sub", "子Agent", "应当被过滤", '["file:///tmp/demo"]', now_iso, "conv-main", 1),
+            )
+            conn.commit()
+            conn.close()
+
+            # Fake Codex home with rollout summary + Guardian review noise
+            codex_home = os.path.join(tmpdir, "codex_home")
+            rs_dir = os.path.join(codex_home, "memories", "rollout_summaries")
+            os.makedirs(rs_dir, exist_ok=True)
+            with open(os.path.join(codex_home, "session_index.jsonl"), "w", encoding="utf-8") as fh:
+                fh.write(json.dumps({"id": "cx-noise", "thread_name": "Guardian review", "updated_at": now_iso}) + "\n")
+                fh.write(json.dumps({"id": "cx-1", "thread_name": "Codex 实测", "updated_at": now_iso}) + "\n")
+            with open(os.path.join(rs_dir, "summary1.md"), "w", encoding="utf-8") as fh:
+                fh.write(
+                    f"thread_id: cx-1\nupdated_at: {now_iso}\ncwd: /tmp/demo\n\n"
+                    "# Codex 官方摘要标题\n\nRollout context: 已通过单测验证实时层。\n"
+                )
+
+            # 1. Manual --note writes live WAL and registers optional path
+            saved = live_memory.add_note(
+                data_dir,
+                days,
+                "Agent Context Bus",
+                "完成 Stop Hook 异步写入联调",
+                paths=["~/projects/agent-context-bus"],
+            )
+            wd = saved["workday"]
+            self.assertEqual(saved["note"]["project"], "Agent Context Bus")
+
+            # 2. Live sync records Antigravity + Codex summaries while skipping subagent & noise
+            res = live_memory.sync_live(
+                data_dir,
+                client="antigravity",
+                payload={
+                    "conversationId": "conv-main",
+                    "workspacePaths": ["/tmp/demo"],
+                    "lastUserInput": "测试实时同步",
+                },
+                force_scan=True,
+                rebuild_index=True,
+                index_output=idx_path,
+                ag_db_path=ag_db,
+                codex_home=codex_home,
+                workbuddy_dir=os.path.join(tmpdir, "no_wb"),
+            )
+            self.assertTrue(res["scanned"])
+            self.assertEqual(res["sessions_count"], 2)
+
+            with open(idx_path, "r", encoding="utf-8") as fh:
+                md = fh.read()
+            self.assertIn("今日实时动态", md)
+            self.assertIn("完成 Stop Hook 异步写入联调", md)
+            self.assertIn("Codex 官方摘要标题", md)
+            self.assertNotIn("Guardian review", md)
+            self.assertNotIn("应当被过滤", md)
+
+            # 3. Project & keyword queries fuse today's uncompacted live notes
+            tl = query_memory.query_by_project(days, "Agent Context Bus", data_dir=data_dir)
+            self.assertTrue(any(x["kind"] == "live_note" for x in tl["live"]))
+            self.assertIn("今日实时动态（未压实）", query_memory.format_project_query_md(tl))
+            kw = query_memory.query_keyword(days, "异步写入联调", data_dir=data_dir)
+            self.assertTrue(any(x["kind"] == "live_note" for x in kw["live"]))
+
+            # 4. Once workday is compacted into days, its live block automatically exits MEMORY_INDEX.md
+            compacted_days = days + [{"workday": wd, "work_items": [], "life_items": []}]
+            query_memory.generate_memory_index(compacted_days, output_path=idx_path, data_dir=data_dir)
+            with open(idx_path, "r", encoding="utf-8") as fh:
+                md_after = fh.read()
+            self.assertNotIn("今日实时动态", md_after)
+
+            # 5. hook_bridge always outputs valid {} and exits 0 even on malformed stdin
+            bridge_proc = subprocess.run(
+                [sys.executable, os.path.join(os.path.dirname(__file__), "hook_bridge.py"), "--client", "antigravity", "--event", "NonStop"],
+                input="{broken-json",
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(bridge_proc.returncode, 0)
+            self.assertEqual(json.loads(bridge_proc.stdout.strip()), {})
+
+            # 6. sync_global_rules --sync-hooks preserves existing hooks and is idempotent
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                "sync_global_rules_mod",
+                os.path.join(os.path.dirname(__file__), "skills", "daily-memory", "scripts", "sync_global_rules.py"),
+            )
+            sgr = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(sgr)
+
+            ag_hooks_path = os.path.join(tmpdir, "ag_hooks.json")
+            with open(ag_hooks_path, "w", encoding="utf-8") as fh:
+                json.dump({"user-custom": {"Stop": [{"command": "echo hi"}]}}, fh)
+            r1 = sgr.sync_client_hooks("antigravity", path=ag_hooks_path)
+            r2 = sgr.sync_client_hooks("antigravity", path=ag_hooks_path)
+            self.assertEqual(r1["action"], "added")
+            self.assertEqual(r2["action"], "unchanged")
+            saved_ag = json.load(open(ag_hooks_path, encoding="utf-8"))
+            self.assertIn("user-custom", saved_ag)
+            self.assertTrue(saved_ag[sgr.HOOK_NAME]["enabled"])
+            r3 = sgr.sync_client_hooks("antigravity", path=ag_hooks_path, disable=True)
+            self.assertEqual(r3["action"], "disabled")
+            self.assertFalse(json.load(open(ag_hooks_path, encoding="utf-8"))[sgr.HOOK_NAME]["enabled"])
+
+            cx_hooks_path = os.path.join(tmpdir, "cx_hooks.json")
+            with open(cx_hooks_path, "w", encoding="utf-8") as fh:
+                json.dump({"hooks": {"Stop": [{"matcher": ".*", "hooks": [{"type": "command", "command": "echo keep"}]}]}}, fh)
+            c1 = sgr.sync_client_hooks("codex", path=cx_hooks_path)
+            c2 = sgr.sync_client_hooks("codex", path=cx_hooks_path)
+            self.assertEqual(c1["action"], "added")
+            self.assertEqual(c2["action"], "unchanged")
+            saved_cx = json.load(open(cx_hooks_path, encoding="utf-8"))
+            self.assertEqual(len(saved_cx["hooks"]["Stop"]), 2)
+            c3 = sgr.sync_client_hooks("codex", path=cx_hooks_path, disable=True)
+            self.assertEqual(c3["action"], "disabled")
+            self.assertEqual(len(json.load(open(cx_hooks_path, encoding="utf-8"))["hooks"]["Stop"]), 1)
 
     def test_workday_boundary_5am(self) -> None:
         tz = ZoneInfo("Asia/Shanghai")
@@ -565,91 +735,6 @@ class DailySummaryTests(unittest.TestCase):
             self.assertEqual(ws_p.cell(row=write_excel.HEADER_ROW, column=14).value, "WB 跨度(h)")
             self.assertAlmostEqual(float(ws_p.cell(row=write_excel.DATA_START_ROW, column=14).value), 0.4, places=2)
             wb.close()
-
-    def test_t3_code_collector_filtering_and_dedup(self) -> None:
-        import sqlite3
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db_path = os.path.join(tmpdir, "statev2.sqlite")
-            conn = sqlite3.connect(db_path)
-            conn.executescript(
-                """
-                CREATE TABLE projection_projects (
-                    project_id TEXT PRIMARY KEY,
-                    title TEXT NOT NULL,
-                    workspace_root TEXT NOT NULL
-                );
-                CREATE TABLE orchestration_v2_projection_threads (
-                    thread_id TEXT PRIMARY KEY,
-                    project_id TEXT NOT NULL,
-                    title TEXT NOT NULL,
-                    default_provider TEXT NOT NULL,
-                    provider_instance_id TEXT,
-                    archived_at TEXT,
-                    deleted_at TEXT,
-                    payload_json TEXT NOT NULL
-                );
-                CREATE TABLE orchestration_v2_projection_provider_threads (
-                    provider_thread_id TEXT PRIMARY KEY,
-                    thread_id TEXT,
-                    provider TEXT NOT NULL,
-                    provider_session_id TEXT
-                );
-                CREATE TABLE orchestration_v2_projection_messages (
-                    message_id TEXT PRIMARY KEY,
-                    thread_id TEXT NOT NULL,
-                    role TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    payload_json TEXT NOT NULL
-                );
-                """
-            )
-            conn.execute("INSERT INTO projection_projects VALUES ('p1', 't3code', '~/Desktop/t3code')")
-            conn.executemany(
-                "INSERT INTO orchestration_v2_projection_threads VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                [
-                    ("t_ag", "p1", "日报自动化", "antigravity", "antigravity", None, None, json.dumps({"lineage": {}})),
-                    ("t_cb", "p1", "打招呼", "acpRegistry_codebuddy_code", "acpRegistry_codebuddy_code", None, None, json.dumps({"lineage": {}})),
-                    ("t_cl", "p1", "Claude调研", "claudeAgent", "claudeAgent", None, None, json.dumps({"lineage": {}})),
-                    ("t_cx_dup", "p1", "Codex已采集", "codex", "codex", None, None, json.dumps({"lineage": {}})),
-                    ("thread:subagent:1", "p1", "Sub Worker", "antigravity", "antigravity", None, None, json.dumps({"lineage": {"relationshipToParent": "subagent"}})),
-                    ("t_handoff_only", "p1", "仅交接未发言", "antigravity", "antigravity", None, None, json.dumps({"lineage": {}})),
-                    ("t_auto", "p1", "每日工作汇总", "antigravity", "antigravity", None, None, json.dumps({"lineage": {}})),
-                ],
-            )
-            conn.execute("INSERT INTO orchestration_v2_projection_provider_threads VALUES ('pt1', 't_cx_dup', 'codex', 'cx-uuid-1')")
-            conn.executemany(
-                "INSERT INTO orchestration_v2_projection_messages VALUES (?, ?, ?, ?, ?)",
-                [
-                    ("m1", "t_ag", "user", "2026-11-24T03:07:26Z", json.dumps({"createdBy": "agent", "creationSource": "mcp", "text": "交接上下文"})),
-                    ("m2", "t_ag", "user", "2026-11-24T03:12:00Z", json.dumps({"createdBy": "user", "creationSource": "web", "text": "把自动化搬到 T3 Code 上跑"})),
-                    ("m3", "t_ag", "assistant", "2026-11-24T03:13:00Z", json.dumps({"createdBy": "agent", "creationSource": "provider", "text": "已完成 T3 适配和定时任务"})),
-                    ("m4", "t_cb", "user", "2026-11-24T02:14:00Z", json.dumps({"createdBy": "user", "creationSource": "web", "text": "哈喽"})),
-                    ("m5", "t_cl", "user", "2026-11-24T04:00:00Z", json.dumps({"createdBy": "user", "creationSource": "web", "text": "分析代码结构"})),
-                    ("m6", "t_cx_dup", "user", "2026-11-24T04:10:00Z", json.dumps({"createdBy": "user", "creationSource": "web", "text": "修个bug"})),
-                    ("m7", "thread:subagent:1", "user", "2026-11-24T04:15:00Z", json.dumps({"createdBy": "user", "creationSource": "web", "text": "子任务"})),
-                    ("m8", "t_handoff_only", "user", "2026-11-24T03:07:30Z", json.dumps({"createdBy": "agent", "creationSource": "mcp", "text": "纯迁移交接"})),
-                    ("m9", "t_auto", "user", "2026-11-24T01:00:00Z", json.dumps({"createdBy": "user", "creationSource": "scheduled", "text": "[DAILY-SUMMARY-AUTO] 执行汇总"})),
-                ],
-            )
-            conn.commit()
-            conn.close()
-
-            tz = ZoneInfo("Asia/Shanghai")
-            start_dt, end_dt = collect.workday_bounds("2026-11-24", "Asia/Shanghai", 5)
-            cfg = {"merge_gap_minutes": 30, "self_filter_markers": ["[DAILY-SUMMARY-AUTO]"]}
-            ag, _, cx, _, wb, _, other, _, hints = collect.collect_t3_code(
-                start_dt, end_dt, tz, "2026-11-24", cfg, existing_codex_ids={"cx-uuid-1"}, db_path=db_path
-            )
-            self.assertEqual(len(ag), 1)
-            self.assertEqual(ag[0]["display_title"], "日报自动化 [T3·t3code]")
-            self.assertEqual(ag[0]["user_prompts"], ["把自动化搬到 T3 Code 上跑"])
-            self.assertEqual(len(wb), 1)
-            self.assertEqual(wb[0]["display_title"], "打招呼 [T3·Codebuddy/t3code]")
-            self.assertEqual(len(other), 1)
-            self.assertEqual(other[0]["source"], "Claude")
-            self.assertEqual(len(cx), 0)
-            self.assertEqual(hints.get("cx-uuid-1"), "Codex已采集 [T3·t3code]")
 
     def test_memory_index_generation_and_queries(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -955,13 +1040,11 @@ class NasHubAndMultiMachineTests(unittest.TestCase):
             "antigravity_hours": 1.25,
             "codex_hours": 0.0,
             "workbuddy_hours": 0.0,
-            "t3_other_hours": 0.0,
             "existing_projects": [],
             "counts": {
                 "antigravity_sessions": 1,
                 "codex_sessions": 0,
                 "workbuddy_sessions": 0,
-                "t3_other_sessions": 0,
                 "git_repos": 1,
                 "file_groups": 0,
             },
@@ -979,7 +1062,6 @@ class NasHubAndMultiMachineTests(unittest.TestCase):
             ],
             "codex": [],
             "workbuddy": [],
-            "t3_other": [],
             "git": [
                 {
                     "repo": workspace,

@@ -1,6 +1,6 @@
 # DailyReport · 跨端 AI 记忆中枢（Agent Context Bus）入口
 
-本目录是本地优先的跨端 AI 记忆中枢（Agent Context Bus，每日采集 Antigravity / Codex / WorkBuddy / T3 Code 四端轨迹）的输出目录，为所有客户端提供统一的**情景记忆库、项目关键路径与现行状态索引**。
+本目录是本地优先的跨端 AI 记忆中枢（Agent Context Bus，每日采集 Antigravity / Codex / WorkBuddy 多端轨迹）的输出目录，为所有客户端提供统一的**情景记忆库、项目关键路径与现行状态索引**。
 
 ## 1. AI 读取优先级（重要）
 
@@ -25,6 +25,9 @@
      `python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --add-path "<项目名>" "<物理目录或配置文件路径>"`
      `python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --remove-path "<项目名>" "<路径>"`
      `python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --set-paths "<项目名>" "<路径1>" "<路径2>"`
+   - 0 Token 当日实时记一笔与刷新（跨端秒级同步，次日压实后自动退出）：
+     `python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --note "<项目名>" "<关键结论或改动>"`
+     `python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --live-sync`
    - 检索本机原会话原文片段（v0.2.0，当摘要和 `--raw` 省略具体命令/报错原文时按出处会话 ID 下钻）：
      `python3 ~/.gemini/antigravity/scratch/daily-summary/search_sessions.py --keyword "<原文关键词>" --session-id "<会话 ID>"`
 3. **直接读结构化底层数据（需自定义统计或二次分析时）**：

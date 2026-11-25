@@ -24,7 +24,7 @@ from provenance import SESSION_BUCKETS, verify_day_sources
 from project_identity import name_key
 
 
-SYSTEM_PROMPT = """你是一个跨设备、跨端（Antigravity / Codex / WorkBuddy / T3 Code / Git / 本地文件）工作与个人技术记忆汇总助手。
+SYSTEM_PROMPT = """你是一个跨设备、跨端（Antigravity / Codex / WorkBuddy / Git / 本地文件）工作与个人技术记忆汇总助手。
 输入是某一天（workday）从多台设备合并后的原始轨迹 raw JSON，以及历史已有项目名列表。
 请严格输出**纯 JSON 对象**（不要 markdown 代码块、不要多余说明），格式必须完全符合以下 schema：
 {
@@ -35,7 +35,6 @@ SYSTEM_PROMPT = """你是一个跨设备、跨端（Antigravity / Codex / WorkBu
   "antigravity_hours": 0.0,
   "codex_hours": 0.0,
   "workbuddy_hours": 0.0,
-  "t3_other_hours": 0.0,
   "estimated_hours": 0.0,
   "work_estimated_hours": 0.0,
   "personal_estimated_hours": 0.0,
@@ -46,7 +45,7 @@ SYSTEM_PROMPT = """你是一个跨设备、跨端（Antigravity / Codex / WorkBu
       "suggested_project_id": "可选，仅在本条名称与历史项目不同但有归类依据时提供 existing_projects 中的 ID",
       "project_suggestion_reason": "可选，一句话说明归类依据",
       "category": "分类如 效率工具开发 / 文档与工作资料 / AI应用开发 / 系统与运维",
-      "tool": "Antigravity | Codex | WorkBuddy | T3 Code | Git | 本地文件",
+      "tool": "Antigravity | Codex | WorkBuddy | Git | 本地文件",
       "machine": "来源机器 ID（与 raw 中一致）",
       "session_name": "会话标题或仓库/文件名",
       "summary": "1-2句客观描述做了什么",
@@ -61,7 +60,7 @@ SYSTEM_PROMPT = """你是一个跨设备、跨端（Antigravity / Codex / WorkBu
   ],
   "life_items": [
     {
-      "tool": "Antigravity | Codex | WorkBuddy | T3 Code",
+      "tool": "Antigravity | Codex | WorkBuddy",
       "machine": "来源机器 ID",
       "session_name": "会话标题",
       "topic": "主题/关键词",
@@ -120,12 +119,10 @@ def _compact_raw_for_llm(raw_payload: dict[str, Any], existing_projects: list[di
         "antigravity_hours": raw_payload.get("antigravity_hours", 0.0),
         "codex_hours": raw_payload.get("codex_hours", 0.0),
         "workbuddy_hours": raw_payload.get("workbuddy_hours", 0.0),
-        "t3_other_hours": raw_payload.get("t3_other_hours", 0.0),
         "existing_projects": existing_projects[:60],
         "antigravity": trim_sessions(raw_payload.get("antigravity") or []),
         "codex": trim_sessions(raw_payload.get("codex") or []),
         "workbuddy": trim_sessions(raw_payload.get("workbuddy") or []),
-        "t3_other": trim_sessions(raw_payload.get("t3_other") or []),
         "git": (raw_payload.get("git") or [])[:30],
         "files": (raw_payload.get("files") or [])[:30],
     }
@@ -241,7 +238,6 @@ def normalize_summary_schema(
         "antigravity_hours": round(float(summary.get("antigravity_hours") if summary.get("antigravity_hours") is not None else raw_payload.get("antigravity_hours") or 0.0), 2),
         "codex_hours": round(float(summary.get("codex_hours") if summary.get("codex_hours") is not None else raw_payload.get("codex_hours") or 0.0), 2),
         "workbuddy_hours": round(float(summary.get("workbuddy_hours") if summary.get("workbuddy_hours") is not None else raw_payload.get("workbuddy_hours") or 0.0), 2),
-        "t3_other_hours": round(float(summary.get("t3_other_hours") if summary.get("t3_other_hours") is not None else raw_payload.get("t3_other_hours") or 0.0), 2),
         "estimated_hours": est_hours,
         "work_estimated_hours": round(float(summary.get("work_estimated_hours") if summary.get("work_estimated_hours") is not None else work_hours), 2),
         "personal_estimated_hours": round(float(summary.get("personal_estimated_hours") if summary.get("personal_estimated_hours") is not None else personal_hours), 2),
@@ -320,7 +316,6 @@ def fallback_rule_summarize(
         ("antigravity", "Antigravity", "ag"),
         ("codex", "Codex", "codex"),
         ("workbuddy", "WorkBuddy", "wb"),
-        ("t3_other", "T3 Code", "ag"),
     )
     if import_labels is None:
         import_labels = first_import_project_labels([raw_payload]) if first_import else {}

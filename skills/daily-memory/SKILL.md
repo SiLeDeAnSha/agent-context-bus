@@ -1,11 +1,11 @@
 ---
 name: daily-memory
-description: 跨端 AI 记忆中枢（Agent Context Bus）检索与维护 skill（Antigravity / Codex / WorkBuddy / T3 Code）：秒查项目最新进度与物理路径、按关键词/时间线/原始会话 UUID 与 Git 提交溯源、跨工具接力续做、登记项目目录与配置文件路径、刷新或补跑自动化日报、导出脱敏对外周报/日报，以及一键幂等同步各 AI 客户端全局记忆规则。触发词：找一下之前弄的、接着之前的继续、上次做到哪了、查历史记录、刷新日报、补跑日报、导出周报、同步记忆规则、跨端 AI 记忆中枢、Agent Context Bus、daily-memory。
+description: 跨端 AI 记忆中枢（Agent Context Bus）检索与维护 skill（Antigravity / Codex / WorkBuddy / Claude Code）：秒查项目最新进度与物理路径、按关键词/时间线/原始会话 UUID 与 Git 提交溯源、跨工具接力续做、登记项目目录与配置文件路径、实时记笔记、刷新或补跑自动化日报、导出脱敏对外周报/日报，以及一键幂等同步各 AI 客户端全局记忆规则与 Stop 钩子。触发词：找一下之前弄的、接着之前的继续、上次做到哪了、查历史记录、刷新日报、补跑日报、导出周报、同步记忆规则、跨端 AI 记忆中枢、Agent Context Bus、daily-memory。
 ---
 
 # 跨端 AI 记忆中枢 · Agent Context Bus（Daily Memory）
 
-基于本地优先的跨端 AI 记忆中枢（`~/.gemini/antigravity/scratch/daily-summary/`）与输出目录（`~/Documents/DailyReport/`），为 Antigravity、Codex、Claude Code、WorkBuddy、T3 Code 提供统一的情景记忆、项目关键路径与现行状态索引。
+基于本地优先的跨端 AI 记忆中枢（`~/.gemini/antigravity/scratch/daily-summary/`）与输出目录（`~/Documents/DailyReport/`），为 Antigravity、Codex、Claude Code、WorkBuddy 提供统一的情景记忆、项目关键路径与现行状态索引。
 
 ## 核心铁律
 
@@ -42,7 +42,7 @@ description: 跨端 AI 记忆中枢（Agent Context Bus）检索与维护 skill�
    ```bash
    python3 ~/.gemini/antigravity/scratch/daily-summary/search_sessions.py --keyword "<命令或报错的一段原文>" --session-id "<会话 ID>"
    ```
-   会话 ID 未知时可用 `--client antigravity|codex|workbuddy|t3`、`--date YYYY-MM-DD`、`--from`/`--to` 缩小范围，或加 `--json` 输出结构化结果。默认返回最近 5 个命中片段及其出处；只读命中片段即可，普通日报检索仍走前两步。
+   会话 ID 未知时可用 `--client antigravity|codex|workbuddy`、`--date YYYY-MM-DD`、`--from`/`--to` 缩小范围，或加 `--json` 输出结构化结果。默认返回最近 5 个命中片段及其出处；只读命中片段即可，普通日报检索仍走前两步。
 
 ---
 
@@ -87,8 +87,11 @@ python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --rebuild-in
 # 1. 先只读检查四端（Antigravity / Codex / Claude / WorkBuddy）规则与 Skill 软链状态
 python3 ~/.cc-switch/skills/daily-memory/scripts/sync_global_rules.py --check
 
-# 2. 幂等同步四端全局规则并补齐各端 daily-memory Skill 软链
-python3 ~/.cc-switch/skills/daily-memory/scripts/sync_global_rules.py --sync-skills
+# 2. 幂等同步四端全局规则、补齐 Skill 软链并装配 Antigravity/Codex Stop 钩子（0 注入，仅异步写入实时层）
+python3 ~/.cc-switch/skills/daily-memory/scripts/sync_global_rules.py --sync-skills --sync-hooks
+
+# 如需关闭 Stop 钩子，一键回退：
+python3 ~/.cc-switch/skills/daily-memory/scripts/sync_global_rules.py --disable-hooks
 ```
 
 - 规则目标文件：
@@ -141,6 +144,10 @@ python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --split-proj
 python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --add-path "<项目名>" "<路径1>" "<路径2>"
 python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --remove-path "<项目名>" "<路径>"
 python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --set-paths "<项目名>" "<路径1>" "<路径2>"
+
+# 5. 当日 0 Token 实时动态记一笔 / 强制刷新实时层（跨端交接立即生效）
+python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --note "<项目名>" "<刚完成的关键结论或改动>"
+python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --live-sync
 
 # 如需仅操作本机登记表，加 --local 或 --data-dir；更新后按需 --rebuild-index / --sync-cache
 
