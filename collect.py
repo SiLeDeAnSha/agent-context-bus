@@ -813,6 +813,189 @@ def collect_workbuddy(
     return results, all_ts
 
 
+def list_claude_session_paths(projects_root: str | None = None) -> list[str]:
+    root = projects_root or os.path.expanduser("~/.claude/projects")
+    if not os.path.isdir(root):
+        return []
+    paths: list[str] = []
+    for path in sorted(glob.glob(os.path.join(root, "*", "*.jsonl"))):
+        if os.path.isfile(path):
+            paths.append(path)
+    return paths
+
+
+def extract_text_from_claude_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and item.get("type") == "text":
+                txt = item.get("text")
+                if isinstance(txt, str) and txt.strip():
+                    parts.append(txt)
+        return "\n".join(parts)
+    return ""
+
+
+def clean_claude_user_text(raw: str) -> str:
+    text = re.sub(r"<system-reminder[^>]*>.*?</system-reminder>", "", raw, flags=re.DOTALL)
+    text = re.sub(r"<local-command-(?:stdout|stderr|caveat)[^>]*>.*?</local-command-(?:stdout|stderr|caveat)>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<command-(?:name|message|args)[^>]*>.*?</command-(?:name|message|args)>", "", text, flags=re.DOTALL)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def parse_claude_jsonl_by_day(
+    jpath: str,
+    markers: list[str],
+    tz: ZoneInfo,
+    day_start_hour: int,
+    start_dt: datetime | None = None,
+    end_dt: datetime | None = None,
+    end_workday: str | None = None,
+) -> tuple[dict[str, list[datetime]], dict[str, list[str]], dict[str, list[str]], str, str, bool]:
+    steps_day: dict[str, list[datetime]] = defaultdict(list)
+    prompts_day: dict[str, list[str]] = defaultdict(list)
+    replies_day: dict[str, list[str]] = defaultdict(list)
+    cwd = ""
+    title = ""
+    is_self = False
+
+    try:
+        with open(jpath, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(obj, dict) or obj.get("isSidechain"):
+                    continue
+
+                etype = obj.get("type")
+                if etype == "custom-title" and obj.get("customTitle"):
+                    title = str(obj["customTitle"]).strip()
+                elif etype == "ai-title" and obj.get("aiTitle") and not title:
+                    title = str(obj["aiTitle"]).strip()
+                elif etype == "attachment":
+                    att = obj.get("attachment")
+                    if isinstance(att, dict) and att.get("type") == "environment":
+                        snap = att.get("snapshot")
+                        if isinstance(snap, dict) and snap.get("workingDirectory") and not cwd:
+                            cwd = str(snap["workingDirectory"]).strip()
+                if obj.get("cwd") and not cwd:
+                    cwd = str(obj["cwd"]).strip()
+
+                if etype not in ("user", "assistant"):
+                    continue
+                dt = parse_iso_dt(str(obj.get("timestamp") or ""))
+                if not dt:
+                    continue
+                if start_dt is not None and dt < start_dt:
+                    continue
+                if end_dt is not None and dt >= end_dt:
+                    continue
+                wd = (dt.astimezone(tz) - timedelta(hours=day_start_hour)).strftime("%Y-%m-%d")
+                if end_workday is not None and wd > end_workday:
+                    continue
+
+                msg = obj.get("message")
+                content = msg.get("content") if isinstance(msg, dict) else obj.get("content")
+                text = extract_text_from_claude_content(content)
+                if not text:
+                    continue
+
+                if etype == "user":
+                    if any(m in text for m in markers):
+                        is_self = True
+                        break
+                    cleaned = clean_claude_user_text(text)
+                    if cleaned:
+                        prompts_day[wd].append(cleaned[:300])
+                        steps_day[wd].append(dt)
+                elif etype == "assistant":
+                    cleaned = re.sub(r"\s+", " ", text).strip()
+                    if cleaned:
+                        replies_day[wd].append(cleaned[:300])
+                        steps_day[wd].append(dt)
+    except OSError:
+        pass
+
+    return steps_day, prompts_day, replies_day, cwd, title, is_self
+
+
+def build_claude_record(
+    sid: str,
+    cwd: str,
+    title: str,
+    ts: list[datetime],
+    prompts: list[str],
+    replies: list[str],
+    tz: ZoneInfo,
+    workday: str,
+    gap_min: int,
+) -> dict[str, Any]:
+    final_title = title or (prompts[0][:60] if prompts else sid)
+    return {
+        "source": "Claude Code",
+        "id": sid,
+        "cwd": cwd,
+        "workspace": cwd,
+        "title": final_title,
+        "display_title": final_title,
+        "turn_count": len(prompts),
+        "active_span": format_span(ts, tz, workday),
+        "estimated_hours": estimate_active_hours(ts, gap_min),
+        "user_prompts": compress_turn_history(prompts),
+        "assistant_milestones": sample_assistant_milestones(replies),
+        "last_assistant_reply": replies[-1] if replies else "",
+    }
+
+
+def collect_claude(
+    start_dt: datetime,
+    end_dt: datetime,
+    tz: ZoneInfo,
+    workday: str,
+    cfg: dict[str, Any],
+    *,
+    projects_root: str | None = None,
+) -> tuple[list[dict[str, Any]], list[datetime]]:
+    markers = cfg.get("self_filter_markers", [])
+    gap_min = int(cfg["merge_gap_minutes"])
+    day_start_hour = int(cfg["day_start_hour"])
+
+    results: list[dict[str, Any]] = []
+    all_ts: list[datetime] = []
+
+    for jpath in list_claude_session_paths(projects_root):
+        try:
+            if datetime.fromtimestamp(os.path.getmtime(jpath), tz=timezone.utc) < start_dt:
+                continue
+        except OSError:
+            continue
+        sid = os.path.splitext(os.path.basename(jpath))[0]
+        steps_day, prompts_day, replies_day, cwd, title, is_self = parse_claude_jsonl_by_day(
+            jpath, markers, tz, day_start_hour, start_dt=start_dt, end_dt=end_dt
+        )
+        if is_self or (title and any(m in title for m in markers)):
+            continue
+        ts = steps_day.get(workday, [])
+        prompts = prompts_day.get(workday, [])
+        if not ts or not prompts:
+            continue
+        all_ts.extend(ts)
+        results.append(build_claude_record(sid, cwd, title, ts, prompts, replies_day.get(workday, []), tz, workday, gap_min))
+
+    results.sort(key=lambda x: x["active_span"])
+    return results, all_ts
+
+
 def discover_git_repos(cfg: dict[str, Any]) -> list[str]:
     excludes = [os.path.realpath(os.path.expanduser(p)) for p in cfg.get("exclude_paths", [])]
     exclude_names = set(cfg.get("exclude_dir_names", []))
@@ -1063,15 +1246,18 @@ def build_day_payload(
     start_dt, end_dt = workday_bounds(workday, tz_name, int(cfg["day_start_hour"]))
     mid = multi_machine.normalize_machine_id(machine_id or cfg.get("machine_id"))
 
-    clients = session_clients if session_clients is not None else {"antigravity", "codex", "workbuddy"}
+    clients = session_clients if session_clients is not None else {"antigravity", "codex", "claude", "workbuddy"}
     args = (start_dt, end_dt, tz, workday, cfg)
     ag_items, ag_ts = ([], [])
     codex_items, codex_ts = ([], [])
+    claude_items, claude_ts = ([], [])
     wb_items, wb_ts = ([], [])
     if "antigravity" in clients:
         ag_items, ag_ts = collect_antigravity(*args, allow_missing_metadata=session_clients is not None)
     if "codex" in clients:
         codex_items, codex_ts = collect_codex(*args, paths=codex_paths)
+    if "claude" in clients:
+        claude_items, claude_ts = collect_claude(*args)
     if "workbuddy" in clients:
         wb_items, wb_ts = collect_workbuddy(*args)
 
@@ -1087,7 +1273,7 @@ def build_day_payload(
         except Exception:
             live_notes = []
 
-    all_ts = ag_ts + codex_ts + wb_ts + git_ts
+    all_ts = ag_ts + codex_ts + claude_ts + wb_ts + git_ts
     gap_min = int(cfg["merge_gap_minutes"])
     weekday_cn = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][
         datetime.strptime(workday, "%Y-%m-%d").weekday()
@@ -1102,18 +1288,21 @@ def build_day_payload(
         "overall_estimated_hours": estimate_active_hours(all_ts, gap_min),
         "antigravity_hours": estimate_active_hours(ag_ts, gap_min),
         "codex_hours": estimate_active_hours(codex_ts, gap_min),
+        "claude_hours": estimate_active_hours(claude_ts, gap_min),
         "workbuddy_hours": estimate_active_hours(wb_ts, gap_min),
         "existing_projects": existing_projects,
         "live_notes": live_notes,
         "counts": {
             "antigravity_sessions": len(ag_items),
             "codex_sessions": len(codex_items),
+            "claude_sessions": len(claude_items),
             "workbuddy_sessions": len(wb_items),
             "git_repos": len(git_items),
             "file_groups": len(file_groups),
         },
         "antigravity": multi_machine.tag_items_with_machine(ag_items, mid),
         "codex": multi_machine.tag_items_with_machine(codex_items, mid),
+        "claude": multi_machine.tag_items_with_machine(claude_items, mid),
         "workbuddy": multi_machine.tag_items_with_machine(wb_items, mid),
         "git": multi_machine.tag_items_with_machine(git_items, mid),
         "files": multi_machine.tag_items_with_machine(file_groups, mid),
@@ -1369,15 +1558,34 @@ def collect_all_history_single_pass(cfg: dict[str, Any], end_workday: str) -> li
                 build_workbuddy_record(sid, info, ts, prompts, replies_day[wd], tz, wd, gap_min)
             )
 
+    claude_by_day: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    claude_ts_by_day: dict[str, list[datetime]] = defaultdict(list)
+    for jpath in list_claude_session_paths():
+        sid = os.path.splitext(os.path.basename(jpath))[0]
+        steps_day, prompts_day, replies_day, cwd, title, is_self = parse_claude_jsonl_by_day(
+            jpath, markers, tz, day_start_hour, end_workday=end_workday
+        )
+        if is_self or (title and any(m in title for m in markers)):
+            continue
+        for wd, ts in steps_day.items():
+            prompts = prompts_day[wd]
+            if not prompts:
+                continue
+            claude_ts_by_day[wd].extend(ts)
+            claude_by_day[wd].append(
+                build_claude_record(sid, cwd, title, ts, prompts, replies_day[wd], tz, wd, gap_min)
+            )
+
     existing_projects = load_existing_projects(cfg)
     active_dates = sorted(
-        set(ag_by_day.keys()) | set(cx_by_day.keys()) | set(wb_by_day.keys())
+        set(ag_by_day.keys()) | set(cx_by_day.keys()) | set(claude_by_day.keys()) | set(wb_by_day.keys())
     )
     for wd in active_dates:
         ag_items = sorted(ag_by_day[wd], key=lambda x: x["active_span"])
         cx_items = sorted(cx_by_day[wd], key=lambda x: x["active_span"])
+        claude_items = sorted(claude_by_day[wd], key=lambda x: x["active_span"])
         wb_items = sorted(wb_by_day[wd], key=lambda x: x["active_span"])
-        all_ts = ag_ts_by_day[wd] + cx_ts_by_day[wd] + wb_ts_by_day[wd]
+        all_ts = ag_ts_by_day[wd] + cx_ts_by_day[wd] + claude_ts_by_day[wd] + wb_ts_by_day[wd]
         start_dt, end_dt = workday_bounds(wd, tz_name, day_start_hour)
         weekday_cn = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][
             datetime.strptime(wd, "%Y-%m-%d").weekday()
@@ -1390,17 +1598,20 @@ def collect_all_history_single_pass(cfg: dict[str, Any], end_workday: str) -> li
             "overall_estimated_hours": estimate_active_hours(all_ts, gap_min),
             "antigravity_hours": estimate_active_hours(ag_ts_by_day[wd], gap_min),
             "codex_hours": estimate_active_hours(cx_ts_by_day[wd], gap_min),
+            "claude_hours": estimate_active_hours(claude_ts_by_day[wd], gap_min),
             "workbuddy_hours": estimate_active_hours(wb_ts_by_day[wd], gap_min),
             "existing_projects": existing_projects,
             "counts": {
                 "antigravity_sessions": len(ag_items),
                 "codex_sessions": len(cx_items),
+                "claude_sessions": len(claude_items),
                 "workbuddy_sessions": len(wb_items),
                 "git_repos": 0,
                 "file_groups": 0,
             },
             "antigravity": ag_items,
             "codex": cx_items,
+            "claude": claude_items,
             "workbuddy": wb_items,
             "git": [],
             "files": [],
@@ -1508,7 +1719,7 @@ def main() -> None:
             push_part = f" | PUSHED->{ep.name} (machines={','.join(res.get('machines', []))})"
         print(
             f"{d} ({p['weekday']}) [{machine_id}]: AG={c['antigravity_sessions']}, Codex={c['codex_sessions']}, "
-            f"WB={c.get('workbuddy_sessions', 0)}, Git={c['git_repos']}, Files={c['file_groups']}, "
+            f"Claude={c.get('claude_sessions', 0)}, WB={c.get('workbuddy_sessions', 0)}, Git={c['git_repos']}, Files={c['file_groups']}, "
             f"Span={p['overall_active_span'] or '-'}, EstHours={p['overall_estimated_hours']}{push_part}"
         )
 

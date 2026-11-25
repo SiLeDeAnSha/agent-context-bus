@@ -146,6 +146,7 @@ def merge_raw_payloads(workday: str, machine_payloads: dict[str, dict[str, Any]]
     buckets: dict[str, list[dict[str, Any]]] = {
         "antigravity": [],
         "codex": [],
+        "claude": [],
         "workbuddy": [],
         "git": [],
         "files": [],
@@ -156,6 +157,7 @@ def merge_raw_payloads(workday: str, machine_payloads: dict[str, dict[str, Any]]
     overall_hours = 0.0
     ag_hours = 0.0
     cx_hours = 0.0
+    claude_hours = 0.0
     wb_hours = 0.0
 
     for mid in machines:
@@ -169,6 +171,7 @@ def merge_raw_payloads(workday: str, machine_payloads: dict[str, dict[str, Any]]
         overall_hours += float(p.get("overall_estimated_hours") or 0.0)
         ag_hours += float(p.get("antigravity_hours") or 0.0)
         cx_hours += float(p.get("codex_hours") or 0.0)
+        claude_hours += float(p.get("claude_hours") or 0.0)
         wb_hours += float(p.get("workbuddy_hours") or 0.0)
 
         for ep in p.get("existing_projects") or []:
@@ -179,7 +182,7 @@ def merge_raw_payloads(workday: str, machine_payloads: dict[str, dict[str, Any]]
                 seen_proj_keys.add(pk)
                 existing_projects.append(ep)
 
-        for key in ("antigravity", "codex", "workbuddy"):
+        for key in ("antigravity", "codex", "claude", "workbuddy"):
             for it in p.get(key) or []:
                 if not isinstance(it, dict):
                     continue
@@ -213,7 +216,7 @@ def merge_raw_payloads(workday: str, machine_payloads: dict[str, dict[str, Any]]
             seen_bucket_keys["files"].add(dedup)
             buckets["files"].append(item)
 
-    for key in ("antigravity", "codex", "workbuddy"):
+    for key in ("antigravity", "codex", "claude", "workbuddy"):
         buckets[key].sort(key=lambda x: (str(x.get("active_span") or ""), str(x.get("machine") or "")))
 
     return {
@@ -225,17 +228,20 @@ def merge_raw_payloads(workday: str, machine_payloads: dict[str, dict[str, Any]]
         "overall_estimated_hours": round(overall_hours, 2),
         "antigravity_hours": round(ag_hours, 2),
         "codex_hours": round(cx_hours, 2),
+        "claude_hours": round(claude_hours, 2),
         "workbuddy_hours": round(wb_hours, 2),
         "existing_projects": existing_projects[:80],
         "counts": {
             "antigravity_sessions": len(buckets["antigravity"]),
             "codex_sessions": len(buckets["codex"]),
+            "claude_sessions": len(buckets["claude"]),
             "workbuddy_sessions": len(buckets["workbuddy"]),
             "git_repos": len(buckets["git"]),
             "file_groups": len(buckets["files"]),
         },
         "antigravity": buckets["antigravity"],
         "codex": buckets["codex"],
+        "claude": buckets["claude"],
         "workbuddy": buckets["workbuddy"],
         "git": buckets["git"],
         "files": buckets["files"],

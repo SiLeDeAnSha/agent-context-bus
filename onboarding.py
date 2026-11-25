@@ -24,6 +24,7 @@ from summarizer import fallback_rule_summarize, first_import_project_labels
 CLIENTS = {
     "antigravity": "Antigravity",
     "codex": "Codex",
+    "claude": "Claude Code",
     "workbuddy": "WorkBuddy",
 }
 DEFAULT_OUTPUT = Path(collect.BASE_DIR) / "data" / "first-import"
@@ -95,6 +96,7 @@ def import_week(output: Path) -> int:
     available = {
         "antigravity": has_readable_log(collect.list_antigravity_transcript_paths()),
         "codex": has_readable_log(codex_paths),
+        "claude": has_readable_log(collect.list_claude_session_paths()),
         "workbuddy": has_readable_log(workbuddy_paths[sid] for sid in workbuddy_meta.keys() & workbuddy_paths.keys()),
     }
     selected = choose_clients(available, start, end)

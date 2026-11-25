@@ -348,7 +348,7 @@ def _filter_raw_by_machine(raw_payload: dict[str, Any], machine: str | None) -> 
         return raw_payload
     target = multi_machine.normalize_machine_id(machine)
     out = dict(raw_payload)
-    for key in ("antigravity", "codex", "workbuddy", "git", "files"):
+    for key in ("antigravity", "codex", "claude", "workbuddy", "git", "files"):
         items = raw_payload.get(key) or []
         out[key] = [it for it in items if multi_machine.normalize_machine_id(it.get("machine") or raw_payload.get("machine") or "legacy") == target]
     out["filtered_machine"] = target
