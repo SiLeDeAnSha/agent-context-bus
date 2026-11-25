@@ -86,6 +86,7 @@ run_cmd rsync -avz --delete \
   --include='/query_memory.py' \
   --include='/write_excel.py' \
   --include='/summarizer.py' \
+  --include='/provenance.py' \
   --include='/export_report.py' \
   --include='/server/' \
   --include='/server/app.py' \

@@ -29,6 +29,7 @@ import multi_machine
 import query_memory
 import summarizer
 import write_excel
+from provenance import verify_day_sources
 
 
 MCP_PROTOCOL_VERSION = "2025-03-26"
@@ -216,7 +217,14 @@ class HubState:
             raise ValueError("Empty summary payload.")
         with self._write_lock:
             merged_days = [
-                multi_machine.save_machine_summary(self.data_dir, machine_id, day_obj)
+                multi_machine.save_machine_summary(
+                    self.data_dir,
+                    machine_id,
+                    verify_day_sources(
+                        day_obj,
+                        query_memory.load_raw_day(str(day_obj.get("workday") or ""), data_dir=self.data_dir) or {},
+                    ),
+                )
                 for day_obj in days_payload
             ]
             excel_res = write_excel.update_split_workbooks(
@@ -592,7 +600,7 @@ def make_handler(state: HubState) -> type[BaseHTTPRequestHandler]:
                     "scope": qs.get("scope", "all"),
                     "status": qs.get("status"),
                     "machine": qs.get("machine"),
-                    "raw": qs.get("raw", "").lower() in ("1", "true", "yes"),
+                    "raw": qs.get("raw", "").lower() in ("1", "true", "yes", "sources"),
                     "asc": qs.get("asc", "").lower() in ("1", "true", "yes"),
                     "limit": qs.get("limit") or 20,
                 }

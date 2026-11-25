@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 
 import multi_machine
 import query_memory
+from provenance import verify_day_sources
 
 
 SYSTEM_PROMPT = """你是一个跨设备、跨端（Antigravity / Codex / WorkBuddy / T3 Code / Git / 本地文件）工作与个人技术记忆汇总助手。
@@ -43,6 +44,7 @@ SYSTEM_PROMPT = """你是一个跨设备、跨端（Antigravity / Codex / WorkBu
       "session_name": "会话标题或仓库/文件名",
       "summary": "1-2句客观描述做了什么",
       "outputs": "产出物/提交/文件",
+      "sources": [{"kind": "session | commit | file", "id": "对应原始值", "machine": "原记录机器", "bucket": "会话所属 raw 数组（仅 session）", "repo": "原始仓库路径（仅 commit）"}],
       "active_span": "HH:MM-HH:MM",
       "estimated_hours": 0.0,
       "status": "已完成 | 阶段完成 | 进行中 | 待验证 | 阻塞",
@@ -57,6 +59,7 @@ SYSTEM_PROMPT = """你是一个跨设备、跨端（Antigravity / Codex / WorkBu
       "session_name": "会话标题",
       "topic": "主题/关键词",
       "summary": "简明摘要",
+      "sources": [{"kind": "session", "id": "原始会话 ID", "machine": "原记录机器", "bucket": "会话所属 raw 数组"}],
       "active_span": "HH:MM-HH:MM"
     }
   ],
@@ -72,7 +75,11 @@ SYSTEM_PROMPT = """你是一个跨设备、跨端（Antigravity / Codex / WorkBu
 1. 尽量沿用 existing_projects 中的项目名称和 scope（work vs personal），保持跨天时间线连贯。
 2. 保留每条记录的 machine 字段，使跨电脑接力可追溯。
 3. 纯生活闲聊、非项目探索归入 life_items，项目研发/业务归入 work_items。
-4. 忽略极短无意义测试或纯空对话。"""
+4. 忽略极短无意义测试或纯空对话。
+5. 每条进展和随想填写支持本条描述的 sources。session 的 id 必须逐字取自对应会话的 id，
+   commit 的 id 必须逐字取自对应仓库 commits 中的 hash，file 的 id 必须逐字取自文件组的 paths。
+   仅引用能明确支持本条内容的记录；不能确认时用空数组。同名项目、同日或同工作目录本身不足以证明关联。
+   工作目录和 Git 改动文件由程序从原始记录补全，无需提供。"""
 
 
 def _compact_raw_for_llm(raw_payload: dict[str, Any], existing_projects: list[dict[str, Any]]) -> dict[str, Any]:
@@ -178,6 +185,7 @@ def normalize_summary_schema(summary: dict[str, Any], raw_payload: dict[str, Any
             "session_name": str(it.get("session_name") or "-").strip(),
             "summary": str(it.get("summary") or "-").strip(),
             "outputs": str(it.get("outputs") or "-").strip(),
+            "sources": it.get("sources"),
             "active_span": str(it.get("active_span") or "-").strip(),
             "estimated_hours": round(float(it.get("estimated_hours") or 0.0), 2),
             "status": str(it.get("status") or "阶段完成").strip(),
@@ -198,6 +206,7 @@ def normalize_summary_schema(summary: dict[str, Any], raw_payload: dict[str, Any
             "topic": str(it.get("topic") or "随想记录").strip(),
             "summary": str(it.get("summary") or "-").strip(),
             "active_span": str(it.get("active_span") or "-").strip(),
+            "sources": it.get("sources"),
         }
         if it.get("machine"):
             entry["machine"] = str(it["machine"]).strip()
@@ -242,7 +251,7 @@ def normalize_summary_schema(summary: dict[str, Any], raw_payload: dict[str, Any
     }
     if machines:
         out["machines"] = machines
-    return out
+    return verify_day_sources(out, raw_payload)
 
 
 def fallback_rule_summarize(raw_payload: dict[str, Any]) -> dict[str, Any]:
@@ -273,6 +282,7 @@ def fallback_rule_summarize(raw_payload: dict[str, Any]) -> dict[str, Any]:
                 "session_name": title,
                 "summary": snippet,
                 "outputs": ws or "-",
+                "sources": [{"kind": "session", "id": it.get("id"), "bucket": bucket, "machine": machine}],
                 "active_span": str(it.get("active_span") or "-"),
                 "estimated_hours": round(float(it.get("estimated_hours") or 0.0), 2),
                 "status": "阶段完成",
@@ -290,7 +300,8 @@ def fallback_rule_summarize(raw_payload: dict[str, Any]) -> dict[str, Any]:
             continue
         repo = str(g.get("repo") or g.get("path") or "git-repo").strip()
         commits = g.get("commits") or []
-        msg = "; ".join(str(c.get("message") if isinstance(c, dict) else c) for c in commits[:3]) or "Git 提交"
+        subjects = [c.get("subject") or c.get("message") if isinstance(c, dict) else c for c in commits[:3]]
+        msg = "; ".join(str(subject) for subject in subjects if subject) or "Git 提交"
         entry = {
             "project": os.path.basename(repo.rstrip("/\\")) or repo,
             "category": "代码提交",
@@ -298,6 +309,11 @@ def fallback_rule_summarize(raw_payload: dict[str, Any]) -> dict[str, Any]:
             "session_name": repo,
             "summary": msg[:140],
             "outputs": f"{len(commits)} commits",
+            "sources": [
+                {"kind": "commit", "id": c.get("hash"), "machine": g.get("machine"), "repo": repo}
+                for c in commits
+                if isinstance(c, dict)
+            ],
             "active_span": str(g.get("active_span") or "-"),
             "estimated_hours": 0.0,
             "status": "阶段完成",

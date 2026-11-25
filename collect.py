@@ -1106,7 +1106,7 @@ def collect_git(
                 if dt:
                     all_ts.append(dt)
                 current = {
-                    "hash": parts[0][:8],
+                    "hash": parts[0],
                     "time": dt.astimezone(tz).strftime("%H:%M") if dt else parts[1],
                     "subject": parts[2].strip(),
                     "files": [],
@@ -1191,14 +1191,16 @@ def collect_local_files(
                     base_label = os.path.basename(base)
                     group_key = f"{base_label}/{top}" if top != "(根目录)" else base_label
 
-                grouped[group_key].append((mtime, fname))
+                grouped[group_key].append((mtime, fpath))
 
     summaries: list[dict[str, Any]] = []
     for group_key, items in sorted(grouped.items()):
         items.sort(key=lambda x: x[0], reverse=True)
         unique_names: list[str] = []
         seen = set()
-        for _, name in items:
+        paths = list(dict.fromkeys(path for _, path in items))[:12]
+        for _, path in items:
+            name = os.path.basename(path)
             if name not in seen:
                 seen.add(name)
                 unique_names.append(name)
@@ -1211,6 +1213,7 @@ def collect_local_files(
                 "file_count": len(items),
                 "latest_time": latest_dt,
                 "sample_files": unique_names,
+                "paths": paths,
             }
         )
     return summaries

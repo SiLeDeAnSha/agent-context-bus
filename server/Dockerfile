@@ -15,7 +15,7 @@ RUN pip install --no-cache-dir \
 
 WORKDIR /app
 
-COPY multi_machine.py remote_client.py query_memory.py write_excel.py summarizer.py export_report.py /app/
+COPY multi_machine.py remote_client.py provenance.py query_memory.py write_excel.py summarizer.py export_report.py /app/
 COPY server/app.py /app/server/app.py
 
 RUN mkdir -p /srv/daily-memory/data /srv/daily-memory/DailyReport

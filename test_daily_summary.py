@@ -15,6 +15,7 @@ import collect
 import export_report
 import query_memory
 import write_excel
+from provenance import verify_day_sources
 
 
 class DailySummaryTests(unittest.TestCase):
@@ -429,6 +430,12 @@ class DailySummaryTests(unittest.TestCase):
                             "session_name": "检索CLI开发",
                             "summary": "落地新方案 B",
                             "outputs": "query_memory.py",
+                            "sources": [
+                                {"kind": "session", "id": "uuid-mem-123", "bucket": "antigravity",
+                                 "machine": "", "workspace": "~/demo"},
+                                {"kind": "commit", "id": "abc1234", "repo": "~/demo",
+                                 "machine": "", "files": ["query_memory.py"]},
+                            ],
                             "status": "待验证",
                             "next_step": "跑完单测",
                             "active_span": "14:00-16:00",
@@ -460,6 +467,12 @@ class DailySummaryTests(unittest.TestCase):
                                 "workspace": "~/demo",
                                 "user_prompts": ["实现 query_memory.py 并支持 raw 下钻"],
                                 "assistant_milestones": ["完成索引与检索逻辑"],
+                            },
+                            {
+                                "source": "Antigravity",
+                                "id": "unrelated-id",
+                                "display_title": "记忆库改造与 query_memory.py",
+                                "workspace": "~/demo",
                             }
                         ],
                         "git": [
@@ -497,7 +510,16 @@ class DailySummaryTests(unittest.TestCase):
             tl = query_memory.query_project_timeline(days, "记忆库", include_raw=True, data_dir=data_dir)
             self.assertEqual(tl["total_matches"], 2)
             self.assertEqual(tl["entries"][0]["workday"], "2026-11-24")
-            self.assertEqual(tl["raw"][0]["sessions"][0]["id"], "uuid-mem-123")
+            self.assertEqual([s["id"] for s in tl["raw"][0]["sessions"]], ["uuid-mem-123"])
+            self.assertEqual(tl["entries"][1]["source_status"], "来源待核对")
+            self.assertIn("来源待核对", query_memory.format_project_query_md(tl))
+
+            old = query_memory.query_exact_date(days, "2026-11-20", include_raw=True, data_dir=data_dir)
+            self.assertIsNone(old["raw"])
+            self.assertIn("来源待核对", query_memory.format_exact_date_md(old))
+            offline = query_memory.query_project_timeline(days, "记忆库", include_raw=True, data_dir=tmpdir)
+            self.assertEqual(offline["entries"][0]["raw_sources_unavailable"], 2)
+            self.assertIn("uuid-mem-123", query_memory.format_project_query_md(offline))
 
             kw = query_memory.query_keyword(days, "query_memory", include_raw=True, data_dir=data_dir)
             self.assertEqual(kw["total_matches"], 1)
@@ -506,6 +528,55 @@ class DailySummaryTests(unittest.TestCase):
             life_kw = query_memory.query_keyword(days, "Hydrogen", scope="life", data_dir=data_dir)
             self.assertEqual(life_kw["total_matches"], 1)
             self.assertEqual(life_kw["hits"][0]["kind"], "life_item")
+
+    def test_provenance_verifies_sources_and_preserves_them_in_workbook(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "work.xlsx")
+            raw = {
+                "codex": [
+                    {"id": "shared-id", "machine": "mac", "cwd": "/verified/work"},
+                    {"id": "shared-id", "machine": "win", "workspace": "D:\\other"},
+                ],
+                "git": [{
+                    "machine": "mac", "repo": "/verified/work",
+                    "commits": [{"hash": "abc1234", "files": ["main.py"]}],
+                }],
+                "files": [{"machine": "mac", "paths": ["/verified/work/out.md"], "sample_files": ["out.md"]}],
+            }
+            item = {"project": "多端测试", "scope": "work", "summary": "发布报告", "sources": [
+                {"kind": "session", "id": "shared-id"},
+                {"kind": "session", "id": "shared-id", "machine": "mac", "bucket": "codex", "workspace": "/invented"},
+                {"kind": "commit", "id": "abc1234", "repo": "/verified/work", "files": ["invented.py"]},
+                {"kind": "commit", "id": "abc1234", "repo": "/other/repo"},
+                {"kind": "file", "id": "/verified/work/out.md"},
+                {"kind": "file", "id": "out.md"},
+            ]}
+            prior = {"workday": "2026-11-20", "work_items": [{"project": "旧项目", "manual_note": "保留人工备注"}]}
+            write_excel.update_excel([prior], path, include_life=False)
+
+            day = verify_day_sources({"workday": "2026-11-21", "work_items": [item]}, raw)
+            sources = day["work_items"][0]["sources"]
+            self.assertEqual([ref["kind"] for ref in sources], ["session", "commit", "file"])
+            self.assertEqual(sources[0]["workspace"], "/verified/work")
+            self.assertEqual(sources[1]["files"], ["main.py"])
+
+            raw_dir = os.path.join(tmpdir, "raw", "2026-11")
+            os.makedirs(raw_dir)
+            raw["files"][0]["paths"].append("/verified/work/unrelated.md")
+            with open(os.path.join(raw_dir, "raw_2026-11-21.json"), "w", encoding="utf-8") as f:
+                json.dump(raw, f)
+            result = query_memory.query_exact_date([day], "2026-11-21", include_raw=True, data_dir=tmpdir)
+            self.assertEqual(result["raw"]["files"][0]["sample_files"], ["/verified/work/out.md"])
+            self.assertEqual([s["machine"] for s in result["raw"]["sessions"]], ["mac"])
+
+            write_excel.update_excel([day], path, include_life=False)
+            wb = load_workbook(path)
+            sheet = wb["项目流程明细"]
+            self.assertEqual(sheet["N4"].value, "出处")
+            self.assertIn("/verified/work/out.md", sheet["N5"].value)
+            self.assertEqual(sheet["M6"].value, "保留人工备注")
+            self.assertEqual(sheet["N6"].value, "来源待核对")
+            wb.close()
 
     def test_sync_global_rules_idempotency_and_preservation(self) -> None:
         import importlib.util
@@ -817,6 +888,10 @@ class NasHubAndMultiMachineTests(unittest.TestCase):
                     "session_name": "gpu-broker Win联调",
                     "summary": "在 Windows 台式机完成推理节点验证。",
                     "outputs": "D:\\code\\gpu-broker",
+                    "sources": [
+                        {"kind": "session", "id": "ag-win-1", "bucket": "antigravity", "machine": "win-pc"},
+                        {"kind": "session", "id": "invented-id"},
+                    ],
                     "active_span": "14:00-15:00",
                     "estimated_hours": 1.0,
                     "status": "进行中",
@@ -834,7 +909,7 @@ class NasHubAndMultiMachineTests(unittest.TestCase):
 
             def do_POST(self) -> None:
                 length = int(self.headers.get("Content-Length") or "0")
-                _ = self.rfile.read(length)
+                self.server.request_body = json.loads(self.rfile.read(length))
                 body = json.dumps(
                     {"choices": [{"message": {"content": json.dumps(mock_reply, ensure_ascii=False)}}]},
                     ensure_ascii=False,
@@ -864,6 +939,10 @@ class NasHubAndMultiMachineTests(unittest.TestCase):
                 self.assertEqual(result["machines"], ["win-pc"])
                 self.assertEqual(result["personal_estimated_hours"], 1.0)
                 self.assertEqual(result["work_items"][0]["machine"], "win-pc")
+                sources = result["work_items"][0]["sources"]
+                self.assertEqual([ref["id"] for ref in sources], ["ag-win-1"])
+                self.assertEqual(sources[0]["workspace"], "D:\\code\\gpu-broker")
+                self.assertIn("填写支持本条描述的 sources", llm_srv.request_body["messages"][0]["content"])
         finally:
             llm_srv.shutdown()
             llm_srv.server_close()

@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 
 import multi_machine
 import remote_client
+from provenance import SOURCE_PENDING, SOURCE_RECORDED, SourceIndex, format_sources, source_key
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.environ.get("DAILY_MEMORY_CONFIG_PATH") or os.path.join(BASE_DIR, "config.json")
@@ -78,6 +79,11 @@ def load_all_days(data_dir: str = DEFAULT_DATA_DIR) -> list[dict[str, Any]]:
 
 
 def load_raw_day(workday: str, data_dir: str = DEFAULT_DATA_DIR) -> dict[str, Any] | None:
+    try:
+        if datetime.fromisoformat(workday).date().isoformat() != workday:
+            return None
+    except ValueError:
+        return None
     ym = workday[:7]
     candidates = [
         os.path.join(data_dir, "raw", ym, f"raw_{workday}.json"),
@@ -417,119 +423,80 @@ def generate_memory_index(
     }
 
 
-def extract_raw_matches(
-    workday: str,
-    terms: list[str],
-    data_dir: str = DEFAULT_DATA_DIR,
-    limit: int = 8,
-    machine_filter: str | None = None,
-) -> dict[str, Any]:
-    raw = load_raw_day(workday, data_dir=data_dir)
-    if not raw:
-        return {}
-    raw_machines = raw.get("machines")
+def source_fields(item: dict[str, Any]) -> dict[str, Any]:
+    sources = item.get("sources") or []
+    return {"sources": sources, "source_status": SOURCE_RECORDED if sources else SOURCE_PENDING}
 
-    sessions: list[dict[str, Any]] = []
-    for bucket in ("antigravity", "codex", "workbuddy", "t3_other"):
-        for s in raw.get(bucket) or []:
-            if not isinstance(s, dict):
-                continue
-            if not _matches_machine(s.get("machine") or raw.get("machine"), raw_machines, machine_filter):
-                continue
-            blob = " ".join(
-                [
-                    str(s.get("source") or bucket),
-                    str(s.get("machine") or ""),
-                    str(s.get("title") or ""),
-                    str(s.get("display_title") or ""),
-                    str(s.get("workspace") or ""),
-                    str(s.get("cwd") or ""),
-                    " ".join(str(x) for x in (s.get("user_prompts") or [])),
-                    " ".join(str(x) for x in (s.get("assistant_milestones") or [])),
-                    str(s.get("last_assistant_reply") or ""),
-                ]
-            )
-            if matches_terms(blob, terms):
-                sessions.append(
-                    {
-                        "source": s.get("source") or bucket,
-                        "machine": s.get("machine") or raw.get("machine") or "",
-                        "id": s.get("id", ""),
-                        "title": s.get("display_title") or s.get("title") or "",
-                        "workspace": s.get("workspace") or s.get("cwd") or "",
-                        "active_span": s.get("active_span", ""),
-                        "user_prompts": (s.get("user_prompts") or [])[:4],
-                        "assistant_milestones": (s.get("assistant_milestones") or [])[:3],
+
+def resolve_item_sources(
+    items_by_day: dict[str, list[dict[str, Any]]], data_dir: str, machine_filter: str | None,
+) -> list[dict[str, Any]]:
+    details = []
+    for workday, items in items_by_day.items():
+        if not any(item.get("sources") for item in items):
+            continue
+        raw = load_raw_day(workday, data_dir=data_dir) or {}
+        index = SourceIndex(raw)
+        sessions, repos, files = {}, {}, {}
+        for item in items:
+            expected = found = 0
+            for ref in item.get("sources") or []:
+                if not _matches_machine(ref.get("machine"), raw.get("machines"), machine_filter):
+                    continue
+                expected += 1
+                match = index.lookup(ref)
+                if not match:
+                    continue
+                found += 1
+                canonical, record = match
+                kind, identifier, machine, bucket, repo_path = source_key(canonical)
+                if kind == "session":
+                    sessions[source_key(canonical)] = {
+                        "source": record.get("source") or bucket,
+                        "machine": machine,
+                        "id": identifier,
+                        "title": record.get("display_title") or record.get("title") or "",
+                        "workspace": canonical["workspace"],
+                        "active_span": record.get("active_span", ""),
+                        "user_prompts": (record.get("user_prompts") or [])[:4],
+                        "assistant_milestones": (record.get("assistant_milestones") or [])[:3],
                     }
-                )
-
-    git_hits: list[dict[str, Any]] = []
-    for repo in raw.get("git") or []:
-        if not isinstance(repo, dict):
-            continue
-        if not _matches_machine(repo.get("machine") or raw.get("machine"), raw_machines, machine_filter):
-            continue
-        matched_commits = []
-        for c in repo.get("commits") or []:
-            blob = " ".join(
-                [
-                    str(repo.get("repo") or ""),
-                    str(repo.get("repo_name") or ""),
-                    str(repo.get("machine") or ""),
-                    str(c.get("subject") or ""),
-                    " ".join(str(x) for x in (c.get("files") or [])),
-                ]
-            )
-            if matches_terms(blob, terms):
-                matched_commits.append(
-                    {
-                        "hash": c.get("hash", ""),
-                        "time": c.get("time", ""),
-                        "subject": c.get("subject", ""),
-                        "files": (c.get("files") or [])[:8],
+                elif kind == "commit":
+                    repo, commit = record
+                    repo_info = repos.setdefault((machine, repo_path), {
+                        "repo": repo_path, "repo_name": repo.get("repo_name") or repo_path,
+                        "machine": machine, "commits": {},
+                    })
+                    repo_info["commits"][identifier] = {
+                        "hash": identifier, "time": commit.get("time", ""),
+                        "subject": commit.get("subject") or commit.get("message") or "",
+                        "files": canonical["files"],
                     }
-                )
-        if matched_commits:
-            git_hits.append(
-                {
-                    "repo": repo.get("repo", ""),
-                    "repo_name": repo.get("repo_name", ""),
-                    "machine": repo.get("machine") or raw.get("machine") or "",
-                    "commits": matched_commits[:5],
-                }
-            )
+                else:
+                    group = record.get("group", "")
+                    files[source_key(canonical)] = {
+                        "group": group, "machine": machine, "latest_time": record.get("latest_time", ""),
+                        "sample_files": [identifier],
+                    }
+            if found < expected:
+                item["raw_sources_unavailable"] = expected - found
+        if sessions or repos or files:
+            details.append({
+                "workday": workday,
+                "sessions": list(sessions.values()),
+                "git": [{**repo, "commits": list(repo["commits"].values())} for repo in repos.values()],
+                "files": list(files.values()),
+            })
+    return details
 
-    file_hits: list[dict[str, Any]] = []
-    for fg in raw.get("files") or []:
-        if not isinstance(fg, dict):
-            continue
-        if not _matches_machine(fg.get("machine") or raw.get("machine"), raw_machines, machine_filter):
-            continue
-        blob = " ".join(
-            [
-                str(fg.get("group") or ""),
-                str(fg.get("machine") or ""),
-                " ".join(str(x) for x in (fg.get("sample_files") or [])),
-            ]
-        )
-        if matches_terms(blob, terms):
-            file_hits.append(
-                {
-                    "group": fg.get("group", ""),
-                    "machine": fg.get("machine") or raw.get("machine") or "",
-                    "latest_time": fg.get("latest_time", ""),
-                    "sample_files": (fg.get("sample_files") or [])[:8],
-                }
-            )
 
-    if not (sessions or git_hits or file_hits):
-        return {}
-    return {
-        "workday": workday,
-        "sessions": sessions[:limit],
-        "git": git_hits[:limit],
-        "files": file_hits[:limit],
-    }
+def raw_for_results(
+    items: list[dict[str, Any]], data_dir: str, machine_filter: str | None,
+) -> list[dict[str, Any]]:
+    items_by_day = defaultdict(list)
+    for item in items:
+        items_by_day[item["workday"]].append(item)
+    return resolve_item_sources(items_by_day, data_dir, machine_filter)
 
 
 def query_project_timeline(
@@ -546,7 +513,6 @@ def query_project_timeline(
     terms = parse_terms(project_query)
     entries: list[dict[str, Any]] = []
     matched_projects: set[str] = set()
-    matched_dates: list[str] = []
 
     for d in sorted(days, key=lambda x: str(x.get("workday", "")), reverse=not asc):
         wd = str(d.get("workday", ""))
@@ -562,8 +528,6 @@ def query_project_timeline(
             proj = str(it.get("project") or "")
             if matches_terms(proj, terms):
                 matched_projects.add(proj)
-                if wd not in matched_dates:
-                    matched_dates.append(wd)
                 entries.append(
                     {
                         "workday": wd,
@@ -580,18 +544,12 @@ def query_project_timeline(
                         "next_step": it.get("next_step", ""),
                         "active_span": it.get("active_span", ""),
                         "estimated_hours": it.get("estimated_hours", 0),
+                        **source_fields(it),
                     }
                 )
 
     sliced = entries[:limit]
-    raw_details: list[dict[str, Any]] = []
-    if include_raw:
-        for wd in matched_dates[:5]:
-            rm = extract_raw_matches(wd, terms, data_dir=data_dir, machine_filter=machine_filter)
-            if not rm:
-                rm = extract_raw_matches(wd, [], data_dir=data_dir, limit=4, machine_filter=machine_filter)
-            if rm:
-                raw_details.append(rm)
+    raw_details = raw_for_results(sliced, data_dir, machine_filter) if include_raw else []
 
     return {
         "query": project_query,
@@ -615,7 +573,6 @@ def query_keyword(
 ) -> dict[str, Any]:
     terms = parse_terms(keyword)
     hits: list[dict[str, Any]] = []
-    raw_hits: list[dict[str, Any]] = []
 
     for d in sorted(days, key=lambda x: str(x.get("workday", "")), reverse=not asc):
         wd = str(d.get("workday", ""))
@@ -650,6 +607,7 @@ def query_keyword(
                             "summary": it.get("summary", ""),
                             "outputs": it.get("outputs", ""),
                             "next_step": it.get("next_step", ""),
+                            **source_fields(it),
                         }
                     )
 
@@ -671,6 +629,7 @@ def query_keyword(
                             "session_name": li.get("session_name", ""),
                             "status": "-",
                             "summary": li.get("summary", ""),
+                            **source_fields(li),
                             "outputs": "-",
                             "next_step": "-",
                         }
@@ -695,16 +654,14 @@ def query_keyword(
                     }
                 )
 
-        if include_raw and len(raw_hits) < 6:
-            rm = extract_raw_matches(wd, terms, data_dir=data_dir, machine_filter=machine_filter)
-            if rm:
-                raw_hits.append(rm)
+    sliced = hits[:limit]
+    raw_hits = raw_for_results(sliced, data_dir, machine_filter) if include_raw else []
 
     return {
         "query": keyword,
         "scope": scope,
         "total_matches": len(hits),
-        "hits": hits[:limit],
+        "hits": sliced,
         "raw": raw_hits,
     }
 
@@ -793,21 +750,25 @@ def query_exact_date(
     machine_filter: str | None = None,
     keyword: str | None = None,
 ) -> dict[str, Any]:
-    matched = [d for d in days if str(d.get("workday")) == exact_date]
-    day = matched[0] if matched else None
-    if day and machine_filter:
-        day = dict(day)
-        day["work_items"] = [
-            it for it in (day.get("work_items") or []) if _matches_machine(it.get("machine"), day.get("machines"), machine_filter)
+    day = next((d for d in days if str(d.get("workday")) == exact_date), None)
+    if day is None:
+        return {"workday": exact_date, "day": None, "raw": None}
+    day = dict(day)
+    for collection in ("work_items", "life_items"):
+        day[collection] = [
+            {**item, **source_fields(item)} for item in day.get(collection) or []
+            if _matches_machine(item.get("machine"), day.get("machines"), machine_filter)
         ]
-        day["life_items"] = [
-            li for li in (day.get("life_items") or []) if _matches_machine(li.get("machine"), day.get("machines"), machine_filter)
+    raw_m = None
+    if include_raw:
+        terms = parse_terms(keyword)
+        items = [
+            item for item in [*day["work_items"], *day["life_items"]]
+            if matches_terms(" ".join(str(item.get(key) or "") for key in (
+                "project", "topic", "session_name", "summary", "outputs",
+            )), terms)
         ]
-    raw_m = (
-        extract_raw_matches(exact_date, parse_terms(keyword), data_dir=data_dir, machine_filter=machine_filter)
-        if include_raw
-        else None
-    )
+        raw_m = next(iter(resolve_item_sources({exact_date: items}, data_dir, machine_filter)), None)
     return {"workday": exact_date, "day": day, "raw": raw_m}
 
 
@@ -859,6 +820,14 @@ def format_projects_md(projs: list[dict[str, Any]], limit: int = 50) -> str:
     return "\n".join(lines)
 
 
+def format_item_sources(item: dict[str, Any]) -> str:
+    citations = format_sources(item.get("sources") or [], separator="；")
+    unavailable = item.get("raw_sources_unavailable", 0)
+    if unavailable:
+        citations += f"（{unavailable} 条原始记录当前不可用）"
+    return f"  - 出处：{citations}"
+
+
 def format_project_query_md(res: dict[str, Any]) -> str:
     lines = [f"### 项目时间线：`{res['query']}`（匹配项目 {len(res['matched_projects'])} 个，共 {res['total_matches']} 条记录）"]
     if res["matched_projects"]:
@@ -879,6 +848,7 @@ def format_project_query_md(res: dict[str, Any]) -> str:
             lines.append(f"  - 产出：{e['outputs']}")
         if e["next_step"] and e["next_step"] != "-":
             lines.append(f"  - 下一步：{e['next_step']}")
+        lines.append(format_item_sources(e))
     lines.extend(format_raw_section(res.get("raw") or []))
     return "\n".join(lines)
 
@@ -901,6 +871,8 @@ def format_keyword_query_md(res: dict[str, Any]) -> str:
             lines.append(f"  - 产出：{h['outputs']}")
         if h["next_step"] and h["next_step"] != "-":
             lines.append(f"  - 下一步：{h['next_step']}")
+        if h["kind"] != "day_headline":
+            lines.append(format_item_sources(h))
     lines.extend(format_raw_section(res.get("raw") or []))
     return "\n".join(lines)
 
@@ -927,12 +899,14 @@ def format_exact_date_md(res: dict[str, Any]) -> str:
             )
             if it.get("outputs") and it.get("outputs") != "-":
                 lines.append(f"  - 产出：{it['outputs']}")
+            lines.append(format_item_sources(it))
     life_items = day.get("life_items") or []
     if life_items:
         lines.extend(["", "#### 随想与探索"])
         for li in life_items:
             mach = f" | @{li['machine']}" if li.get("machine") else ""
             lines.append(f"- [{li.get('tool', '')}{mach}] **{li.get('topic', '')}** (`{li.get('session_name', '')}`): {li.get('summary', '')}")
+            lines.append(format_item_sources(li))
     if raw:
         lines.extend(format_raw_section([raw]))
     return "\n".join(lines)
@@ -977,21 +951,30 @@ def _run_remote_query(args: argparse.Namespace, rc: remote_client.RemoteConfig) 
     if args.machine:
         params["machine"] = args.machine
     if args.raw:
-        params["raw"] = "1"
+        params["raw"] = "sources"
     if args.asc:
         params["asc"] = "1"
 
     if args.project:
         params["project"] = args.project
-        text, _ = remote_client.request_text(rc, "GET", "/api/v1/query", params=params, write=False)
-        return text
-    if args.keyword and not args.projects:
+        render = format_project_query_md
+    elif args.keyword and not args.projects:
         params["keyword"] = args.keyword
-        text, _ = remote_client.request_text(rc, "GET", "/api/v1/query", params=params, write=False)
-        return text
-    if args.date:
-        text, _ = remote_client.request_text(rc, "GET", "/api/v1/query", params=params, write=False)
-        return text
+        render = format_keyword_query_md
+    elif args.date:
+        render = format_exact_date_md
+    else:
+        render = None
+
+    if render:
+        params["format"] = "json"
+        result, _ = remote_client.request_json(rc, "GET", "/api/v1/query", params=params, write=False)
+        day = result.get("day") or {}
+        for items in (result.get("entries"), result.get("hits"), day.get("work_items"), day.get("life_items")):
+            for item in items or []:
+                if item.get("kind") != "day_headline" and "source_status" not in item:
+                    item.update(source_fields({}))
+        return json.dumps(result, ensure_ascii=False, indent=2) if args.as_json else render(result)
     if args.keyword:
         params["keyword"] = args.keyword
     text, _ = remote_client.request_text(rc, "GET", "/api/v1/projects", params=params, write=False)
@@ -1021,7 +1004,7 @@ def main() -> None:
     )
     parser.add_argument("--status", help="Filter by status substring (e.g. 进行中).")
     parser.add_argument("--machine", help="Filter results by machine_id (e.g. mac, win-pc).")
-    parser.add_argument("--raw", action="store_true", help="Also drill into data/raw/ for session UUIDs, Git, and files.")
+    parser.add_argument("--raw", action="store_true", help="Open the archived evidence cited by each returned item.")
     parser.add_argument("--asc", action="store_true", help="Sort timeline entries oldest-first.")
     parser.add_argument("--limit", type=int, default=15, help="Max results to return (default: 15).")
     parser.add_argument("--json", dest="as_json", action="store_true", help="Output raw JSON instead of Markdown.")
