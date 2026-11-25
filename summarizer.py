@@ -7,6 +7,7 @@ import argparse
 from collections import defaultdict
 from datetime import datetime, timedelta
 import json
+import ntpath
 import os
 import re
 from typing import Any
@@ -37,7 +38,9 @@ SYSTEM_PROMPT = """你是一个跨设备、跨端（Antigravity / Codex / WorkBu
   "core_outputs": "当天关键产出，分号分隔",
   "work_items": [
     {
-      "project": "尽量沿用历史已有项目名；新项目起简洁中文名",
+      "project": "本条进展的项目名称，保留证据中的名称或别名；新项目起简洁中文名",
+      "suggested_project_id": "可选，仅在本条名称与历史项目不同但有归类依据时提供 existing_projects 中的 ID",
+      "project_suggestion_reason": "可选，一句话说明归类依据",
       "category": "分类如 效率工具开发 / 文档与工作资料 / AI应用开发 / 系统与运维",
       "tool": "Antigravity | Codex | WorkBuddy | T3 Code | Git | 本地文件",
       "machine": "来源机器 ID（与 raw 中一致）",
@@ -72,7 +75,9 @@ SYSTEM_PROMPT = """你是一个跨设备、跨端（Antigravity / Codex / WorkBu
   }
 }
 规则：
-1. 尽量沿用 existing_projects 中的项目名称和 scope（work vs personal），保持跨天时间线连贯。
+1. existing_projects 提供既有项目名、别名、固定 ID 和 scope（work vs personal）。
+   project 必须保留这条进展自身的项目名称。同一项目用了新名字时，保留新名字并建议历史项目 ID，
+   由人工决定是否合并。遇到已知的项目名或别名，沿用其身份。证据不足时省略建议；不得自行添加别名。
 2. 保留每条记录的 machine 字段，使跨电脑接力可追溯。
 3. 纯生活闲聊、非项目探索归入 life_items，项目研发/业务归入 work_items。
 4. 忽略极短无意义测试或纯空对话。
@@ -123,23 +128,7 @@ def _compact_raw_for_llm(raw_payload: dict[str, Any], existing_projects: list[di
 
 
 def collect_existing_projects_from_history(data_dir: str) -> list[dict[str, Any]]:
-    days = query_memory.load_all_days(data_dir)
-    latest: dict[str, dict[str, Any]] = {}
-    for d in days:
-        wd = str(d.get("workday") or "")
-        for it in d.get("work_items") or []:
-            proj = str(it.get("project") or "").strip()
-            if not proj:
-                continue
-            latest[proj] = {
-                "project": proj,
-                "scope": str(it.get("scope") or "personal"),
-                "category": str(it.get("category") or ""),
-                "last_date": wd,
-                "status": str(it.get("status") or ""),
-            }
-    ordered = sorted(latest.values(), key=lambda x: x["last_date"], reverse=True)
-    return ordered[:60]
+    return query_memory.project_candidates(data_dir)[:60]
 
 
 def _extract_json_object(raw_text: str) -> dict[str, Any]:
@@ -162,7 +151,9 @@ def _extract_json_object(raw_text: str) -> dict[str, Any]:
     raise ValueError("LLM response did not contain a valid JSON object.")
 
 
-def normalize_summary_schema(summary: dict[str, Any], raw_payload: dict[str, Any]) -> dict[str, Any]:
+def normalize_summary_schema(
+    summary: dict[str, Any], raw_payload: dict[str, Any], *, valid_project_ids: set[str] | None = None,
+) -> dict[str, Any]:
     """Ensure required keys and numeric invariants match write_excel.py expectations."""
     workday = str(raw_payload.get("workday") or summary.get("workday") or "")
     weekday = str(summary.get("weekday") or raw_payload.get("weekday") or "")
@@ -194,6 +185,12 @@ def normalize_summary_schema(summary: dict[str, Any], raw_payload: dict[str, Any
         }
         if it.get("machine"):
             entry["machine"] = str(it["machine"]).strip()
+        suggestion = it.get("suggested_project_id")
+        if isinstance(suggestion, str) and valid_project_ids is not None and suggestion in valid_project_ids:
+            entry["suggested_project_id"] = suggestion
+            reason = it.get("project_suggestion_reason")
+            if isinstance(reason, str):
+                entry["project_suggestion_reason"] = reason.strip()[:300]
         work_items.append(entry)
 
     life_items: list[dict[str, Any]] = []
@@ -270,7 +267,7 @@ def fallback_rule_summarize(raw_payload: dict[str, Any]) -> dict[str, Any]:
                 continue
             title = str(it.get("title") or it.get("id") or "未命名会话").strip()
             ws = str(it.get("workspace") or it.get("cwd") or "").strip()
-            proj = os.path.basename(ws.rstrip("/\\")) if ws else title[:24]
+            proj = ntpath.basename(ws.rstrip("/\\")) if ws else title[:24]
             prompts = it.get("user_prompts") or []
             milestones = it.get("assistant_milestones") or []
             snippet = str(milestones[-1] if milestones else (prompts[0] if prompts else title))[:140]
@@ -303,7 +300,7 @@ def fallback_rule_summarize(raw_payload: dict[str, Any]) -> dict[str, Any]:
         subjects = [c.get("subject") or c.get("message") if isinstance(c, dict) else c for c in commits[:3]]
         msg = "; ".join(str(subject) for subject in subjects if subject) or "Git 提交"
         entry = {
-            "project": os.path.basename(repo.rstrip("/\\")) or repo,
+            "project": ntpath.basename(repo.rstrip("/\\")) or repo,
             "category": "代码提交",
             "tool": "Git",
             "session_name": repo,
@@ -402,7 +399,10 @@ def call_openai_compatible_llm(
         raise RuntimeError(f"LLM returned no choices: {str(resp_data)[:240]}")
     content = choices[0].get("message", {}).get("content", "")
     parsed = _extract_json_object(content)
-    return normalize_summary_schema(parsed, raw_payload)
+    return normalize_summary_schema(
+        parsed, raw_payload,
+        valid_project_ids={p["project_id"] for p in existing_projects[:60] if p.get("project_id")},
+    )
 
 
 def summarize_workday(

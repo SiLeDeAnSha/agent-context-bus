@@ -16,9 +16,65 @@ import export_report
 import query_memory
 import write_excel
 from provenance import verify_day_sources
+from project_identity import ProjectCatalog, edit_registry, load_registry, project_id
 
 
 class DailySummaryTests(unittest.TestCase):
+    def test_project_decisions_update_old_and_future_progress(self) -> None:
+        from summarizer import normalize_summary_schema
+
+        main = "ComfyUI 人像与视频管线"
+        alias = "comfyui-mcp"
+        face = "保脸工作流"
+        main_id = project_id(main)
+        face_id = project_id(face)
+        old = {
+            "workday": "2026-11-21",
+            "work_items": [{"project": main}, {"project": alias}],
+            "project_briefs": {main: {"ag": "人像处理"}, alias: {"codex": "MCP 集成"}},
+        }
+        new = normalize_summary_schema(
+            {"work_items": [
+                {"project": face, "suggested_project_id": main_id, "project_suggestion_reason": "人像工作流"},
+                {"project": "其他", "suggested_project_id": "invented-id"},
+            ]},
+            {"workday": "2026-11-22"},
+            valid_project_ids={main_id},
+        )
+        days = [old, new]
+        with tempfile.TemporaryDirectory() as data_dir:
+            before = ProjectCatalog(days)
+            self.assertEqual(before.for_item(new["work_items"][0])["project_id"], face_id)
+            self.assertEqual([p["label"] for p in before.suggestions(days)], [face])
+            self.assertNotIn("suggested_project_id", new["work_items"][1])
+            merged = edit_registry(data_dir, days, "merge", main, [alias, face])
+            self.assertEqual(merged["project_id"], main_id)
+            self.assertEqual(edit_registry(data_dir, days, "merge", main_id, [alias, face]), merged)
+            for term in (main, main_id, alias, "ＣＯＭＦＹＵＩ－ＭＣＰ", face, face_id):
+                result = query_memory.query_by_project(days, term, data_dir=data_dir)
+                self.assertEqual(result["total_matches"], 3)
+                self.assertEqual([p["project_id"] for p in result["matched_identities"]], [main_id])
+                self.assertEqual(result["entries"][0]["project_label"], face)
+            catalog = ProjectCatalog(days, load_registry(data_dir))
+            self.assertEqual(catalog.suggestions(days), [])
+            self.assertEqual(catalog.briefs(old["project_briefs"]), {main: {"ag": "人像处理", "codex": "MCP 集成"}})
+
+            split = edit_registry(data_dir, days, "split", face, [])
+            self.assertEqual(split["project_id"], face_id)
+            self.assertEqual(edit_registry(data_dir, days, "split", face, []), split)
+            future = {"workday": "2026-11-23", "work_items": [{"project": face, "suggested_project_id": main_id}]}
+            write_excel.sync_json_indexes(days + [future], data_dir=data_dir)
+            history = query_memory.load_all_days(data_dir)
+            catalog = ProjectCatalog(history, load_registry(data_dir))
+            self.assertEqual(catalog.suggestions(history), [])
+            self.assertEqual(query_memory.query_by_project(history, face_id, data_dir=data_dir)["total_matches"], 2)
+            self.assertEqual(query_memory.query_by_project(history, main_id, data_dir=data_dir)["total_matches"], 2)
+            self.assertEqual(query_memory.query_keyword(history, alias, data_dir=data_dir)["total_matches"], 2)
+            self.assertEqual(query_memory.query_exact_date(history, old["workday"], data_dir=data_dir)
+                             ["day"]["work_items"][1]["project"], main)
+            self.assertEqual(history[0]["work_items"][1]["project"], alias)
+            self.assertEqual(query_memory.project_candidates(data_dir)[0]["project_id"], face_id)
+
     def test_workday_boundary_5am(self) -> None:
         tz = ZoneInfo("Asia/Shanghai")
         start, end = collect.workday_bounds("2026-11-21", "Asia/Shanghai", 5)
@@ -795,6 +851,18 @@ class NasHubAndMultiMachineTests(unittest.TestCase):
                 self.assertIn("ag-win-1", win_only_md)
                 self.assertNotIn("ag-mac-1", win_only_md)
 
+                project = {"action": "merge", "target": "gpu-broker", "labels": ["推理调度器"]}
+                with self.assertRaises(remote_client.RemoteAuthError):
+                    remote_client.request_json(
+                        ro_rc, "POST", "/api/v1/project-review", json_body=project, write=True,
+                    )
+                edited, _ = remote_client.request_json(
+                    rw_rc, "POST", "/api/v1/project-review", json_body=project, write=True,
+                )
+                self.assertEqual(edited["project"]["aliases"], ["推理调度器"])
+                review, _ = remote_client.request_json(ro_rc, "GET", "/api/v1/project-review")
+                self.assertEqual(review["suggestions"], [])
+
                 sync_info = remote_client.sync_local_cache(ro_rc)
                 self.assertEqual(sync_info["total_days"], 1)
                 self.assertTrue(os.path.exists(sync_info["index_path"]))
@@ -828,7 +896,7 @@ class NasHubAndMultiMachineTests(unittest.TestCase):
                         "jsonrpc": "2.0",
                         "id": 3,
                         "method": "tools/call",
-                        "params": {"name": "memory_query", "arguments": {"project": "gpu-broker", "machine": "macbook", "raw": True}},
+                        "params": {"name": "memory_query", "arguments": {"project": "推理调度器", "machine": "macbook", "raw": True}},
                     },
                     write=False,
                 )
@@ -858,7 +926,7 @@ class NasHubAndMultiMachineTests(unittest.TestCase):
                     "--remote-config",
                     remote_cfg_path,
                     "--project",
-                    "gpu-broker",
+                    "推理调度器",
                 ],
                 capture_output=True,
                 text=True,

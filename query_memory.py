@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 
 import multi_machine
 import remote_client
+from project_identity import ProjectCatalog, edit_registry, item_name, load_registry, name_key
 from provenance import SOURCE_PENDING, SOURCE_RECORDED, SourceIndex, format_sources, source_key
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -76,6 +77,18 @@ def load_all_days(data_dir: str = DEFAULT_DATA_DIR) -> list[dict[str, Any]]:
                     if d.get("workday"):
                         by_day[str(d["workday"])] = d
     return [by_day[k] for k in sorted(by_day.keys())]
+
+
+def project_candidates(data_dir: str) -> list[dict[str, Any]]:
+    days = load_all_days(data_dir)
+    catalog = ProjectCatalog(days, load_registry(data_dir))
+    projects = aggregate_projects(days, catalog=catalog)
+    seen = {p["project_id"] for p in projects}
+    fields = ("project_id", "project", "aliases", "scope", "category", "last_date", "status", "next_step")
+    candidates = [
+        {**{k: p[k] for k in fields}, "sessions": "；".join(p["recent_sessions"])[:160]} for p in projects
+    ]
+    return candidates + [p for p in catalog.projects.values() if p["project_id"] not in seen]
 
 
 def load_raw_day(workday: str, data_dir: str = DEFAULT_DATA_DIR) -> dict[str, Any] | None:
@@ -185,9 +198,11 @@ def aggregate_projects(
     days: list[dict[str, Any]],
     scope: str = "all",
     machine_filter: str | None = None,
+    catalog: ProjectCatalog | None = None,
 ) -> list[dict[str, Any]]:
     """Aggregate chronological day summaries into per-project current-state snapshots."""
     ordered_days = sorted(days, key=lambda d: str(d.get("workday", "")))
+    catalog = catalog if catalog is not None else ProjectCatalog(ordered_days)
     by_proj: dict[str, list[tuple[dict[str, Any], dict[str, Any]]]] = defaultdict(list)
 
     for day in ordered_days:
@@ -198,11 +213,13 @@ def aggregate_projects(
                 continue
             if not _matches_machine(it.get("machine"), day_machines, machine_filter):
                 continue
-            proj = str(it.get("project") or "未命名项目").strip()
-            by_proj[proj].append((day, it))
+            identity = catalog.for_item(it)
+            by_proj[identity["project_id"]].append((day, it))
 
     results: list[dict[str, Any]] = []
-    for proj, pairs in by_proj.items():
+    for identity_id, pairs in by_proj.items():
+        identity = catalog.projects.get(identity_id) or catalog.for_item(pairs[0][1])
+        proj = identity["project"]
         dates = [str(d["workday"]) for d, _ in pairs]
         first_d = min(dates)
         last_d = max(dates)
@@ -263,11 +280,13 @@ def aggregate_projects(
                 break
 
         last_day_pairs = [(d, it) for d, it in pairs if str(d["workday"]) == last_d]
-        latest_brief = _extract_latest_brief(proj, last_day_pairs[-1][0], [it for _, it in last_day_pairs])
+        last_day = last_day_pairs[-1][0]
+        briefs = catalog.briefs(last_day.get("project_briefs") or {})
+        latest_brief = _extract_latest_brief(proj, {"project_briefs": briefs}, [it for _, it in last_day_pairs])
 
         results.append(
             {
-                "project": proj,
+                **identity,
                 "scope": max(scopes.items(), key=lambda kv: kv[1])[0],
                 "category": max(cats.items(), key=lambda kv: kv[1])[0],
                 "first_date": first_d,
@@ -293,10 +312,12 @@ def render_memory_index(
     days: list[dict[str, Any]],
     tz_name: str = "Asia/Shanghai",
     now_str: str | None = None,
+    catalog: ProjectCatalog | None = None,
 ) -> str:
     ordered_days = sorted(days, key=lambda d: str(d.get("workday", "")))
-    work_projs = aggregate_projects(ordered_days, scope="work")
-    personal_projs = aggregate_projects(ordered_days, scope="personal")
+    catalog = catalog if catalog is not None else ProjectCatalog(ordered_days)
+    work_projs = aggregate_projects(ordered_days, scope="work", catalog=catalog)
+    personal_projs = aggregate_projects(ordered_days, scope="personal", catalog=catalog)
     all_projs = sorted(
         work_projs + personal_projs,
         key=lambda r: (r["last_date"], r["total_hours"], r["project"]),
@@ -401,9 +422,10 @@ def generate_memory_index(
     days: list[dict[str, Any]],
     output_path: str | None = None,
     tz_name: str = "Asia/Shanghai",
+    catalog: ProjectCatalog | None = None,
 ) -> dict[str, Any]:
     target = os.path.expanduser(output_path or resolve_index_path())
-    content = render_memory_index(days, tz_name=tz_name)
+    content = render_memory_index(days, tz_name=tz_name, catalog=catalog)
     out_dir = os.path.dirname(os.path.abspath(target))
     os.makedirs(out_dir, exist_ok=True)
     tmp_path = target + ".tmp.md"
@@ -412,8 +434,8 @@ def generate_memory_index(
     os.replace(tmp_path, target)
 
     ordered = sorted(days, key=lambda d: str(d.get("workday", "")))
-    work_cnt = len(aggregate_projects(ordered, scope="work"))
-    personal_cnt = len(aggregate_projects(ordered, scope="personal"))
+    work_cnt = len(aggregate_projects(ordered, scope="work", catalog=catalog))
+    personal_cnt = len(aggregate_projects(ordered, scope="personal", catalog=catalog))
     return {
         "path": target,
         "days": len(ordered),
@@ -509,10 +531,14 @@ def query_project_timeline(
     data_dir: str = DEFAULT_DATA_DIR,
     status_filter: str | None = None,
     machine_filter: str | None = None,
+    catalog: ProjectCatalog | None = None,
 ) -> dict[str, Any]:
-    terms = parse_terms(project_query)
+    query_key = name_key(project_query)
+    terms = query_key.split()
+    catalog = catalog if catalog is not None else ProjectCatalog(days, load_registry(data_dir))
+    exact_match = catalog.lookup(project_query) if query_key in catalog.confirmed_names or query_key in catalog.by_id else None
     entries: list[dict[str, Any]] = []
-    matched_projects: set[str] = set()
+    matched_projects: dict[str, dict] = {}
 
     for d in sorted(days, key=lambda x: str(x.get("workday", "")), reverse=not asc):
         wd = str(d.get("workday", ""))
@@ -525,15 +551,21 @@ def query_project_timeline(
                 continue
             if not _matches_machine(it.get("machine"), day_machines, machine_filter):
                 continue
-            proj = str(it.get("project") or "")
-            if matches_terms(proj, terms):
-                matched_projects.add(proj)
+            identity = catalog.for_item(it)
+            if exact_match is not None:
+                matched = identity["project_id"] == exact_match["project_id"]
+            else:
+                matched = any(matches_terms(name_key(label), terms)
+                              for label in [identity["project"], *identity["aliases"]])
+            if matched:
+                matched_projects[identity["project_id"]] = identity
                 entries.append(
                     {
                         "workday": wd,
                         "weekday": d.get("weekday", ""),
                         "scope": item_scope,
-                        "project": proj,
+                        **identity,
+                        "project_label": item_name(it),
                         "category": it.get("category", ""),
                         "tool": it.get("tool") or it.get("source") or "",
                         "machine": it.get("machine", ""),
@@ -551,9 +583,11 @@ def query_project_timeline(
     sliced = entries[:limit]
     raw_details = raw_for_results(sliced, data_dir, machine_filter) if include_raw else []
 
+    projects = sorted(matched_projects.values(), key=lambda p: p["project"])
     return {
         "query": project_query,
-        "matched_projects": sorted(matched_projects),
+        "matched_projects": [p["project"] for p in projects],
+        "matched_identities": projects,
         "total_matches": len(entries),
         "entries": sliced,
         "raw": raw_details,
@@ -570,8 +604,11 @@ def query_keyword(
     status_filter: str | None = None,
     machine_filter: str | None = None,
     asc: bool = False,
+    catalog: ProjectCatalog | None = None,
 ) -> dict[str, Any]:
     terms = parse_terms(keyword)
+    catalog = catalog if catalog is not None else ProjectCatalog(days, load_registry(data_dir))
+    exact_project = catalog.lookup(keyword)
     hits: list[dict[str, Any]] = []
 
     for d in sorted(days, key=lambda x: str(x.get("workday", "")), reverse=not asc):
@@ -588,18 +625,21 @@ def query_keyword(
                     continue
                 if not _matches_machine(it.get("machine"), day_machines, machine_filter):
                     continue
+                identity = catalog.for_item(it)
                 blob = " ".join(
                     str(it.get(k) or "")
                     for k in ("project", "category", "tool", "machine", "session_name", "summary", "outputs", "next_step")
                 )
-                if matches_terms(blob, terms):
+                names = " ".join([identity["project"], *identity["aliases"]])
+                if identity == exact_project or matches_terms(f"{blob} {names}", terms):
                     day_matched = True
                     hits.append(
                         {
                             "kind": "work_item",
                             "workday": wd,
                             "scope": item_scope,
-                            "project": it.get("project", ""),
+                            **identity,
+                            "project_label": item_name(it),
                             "tool": it.get("tool") or it.get("source") or "",
                             "machine": it.get("machine", ""),
                             "session_name": it.get("session_name", ""),
@@ -673,9 +713,10 @@ def query_projects(
     status_filter: str | None = None,
     machine_filter: str | None = None,
     keyword: str | None = None,
+    catalog: ProjectCatalog | None = None,
 ) -> list[dict[str, Any]]:
     proj_scope = "all" if scope == "life" else scope
-    projs = aggregate_projects(days, scope=proj_scope, machine_filter=machine_filter)
+    projs = aggregate_projects(days, scope=proj_scope, machine_filter=machine_filter, catalog=catalog)
     if status_filter:
         projs = [p for p in projs if status_filter in p["status"]]
     if keyword:
@@ -684,7 +725,8 @@ def query_projects(
             p
             for p in projs
             if matches_terms(
-                f"{p['project']} {p['category']} {p['latest_summary']} {p['next_step']}",
+                f"{p['project']} {' '.join(p['aliases'])} {p['project_id']} "
+                f"{p['category']} {p['latest_summary']} {p['next_step']}",
                 terms,
             )
         ]
@@ -702,6 +744,7 @@ def query_by_project(
     data_dir: str = DEFAULT_DATA_DIR,
     asc: bool = False,
     limit: int = 30,
+    catalog: ProjectCatalog | None = None,
 ) -> dict[str, Any]:
     return query_project_timeline(
         days,
@@ -713,6 +756,7 @@ def query_by_project(
         data_dir=data_dir,
         status_filter=status_filter,
         machine_filter=machine_filter,
+        catalog=catalog,
     )
 
 
@@ -727,6 +771,7 @@ def query_by_keyword(
     data_dir: str = DEFAULT_DATA_DIR,
     asc: bool = False,
     limit: int = 15,
+    catalog: ProjectCatalog | None = None,
 ) -> dict[str, Any]:
     return query_keyword(
         days,
@@ -738,6 +783,7 @@ def query_by_keyword(
         status_filter=status_filter,
         machine_filter=machine_filter,
         asc=asc,
+        catalog=catalog,
     )
 
 
@@ -749,16 +795,23 @@ def query_exact_date(
     data_dir: str = DEFAULT_DATA_DIR,
     machine_filter: str | None = None,
     keyword: str | None = None,
+    catalog: ProjectCatalog | None = None,
 ) -> dict[str, Any]:
     day = next((d for d in days if str(d.get("workday")) == exact_date), None)
     if day is None:
         return {"workday": exact_date, "day": None, "raw": None}
+    catalog = catalog if catalog is not None else ProjectCatalog(days, load_registry(data_dir))
     day = dict(day)
     for collection in ("work_items", "life_items"):
         day[collection] = [
             {**item, **source_fields(item)} for item in day.get(collection) or []
             if _matches_machine(item.get("machine"), day.get("machines"), machine_filter)
         ]
+    day["work_items"] = [
+        {**item, **catalog.for_item(item), "project_label": item_name(item)}
+        for item in day["work_items"]
+    ]
+    day["project_briefs"] = catalog.briefs(day.get("project_briefs") or {})
     raw_m = None
     if include_raw:
         terms = parse_terms(keyword)
@@ -832,6 +885,11 @@ def format_project_query_md(res: dict[str, Any]) -> str:
     lines = [f"### 项目时间线：`{res['query']}`（匹配项目 {len(res['matched_projects'])} 个，共 {res['total_matches']} 条记录）"]
     if res["matched_projects"]:
         lines.append(f"> 项目名：{', '.join(res['matched_projects'])}")
+    if len(res.get("matched_identities") or []) == 1:
+        project = res["matched_identities"][0]
+        lines.append(f"> 项目 ID：`{project['project_id']}`")
+        if project["aliases"]:
+            lines.append(f"> 别名：{'、'.join(project['aliases'])}")
     lines.append("")
     if not res["entries"]:
         lines.append("_无匹配记录_")
@@ -981,6 +1039,45 @@ def _run_remote_query(args: argparse.Namespace, rc: remote_client.RemoteConfig) 
     return text
 
 
+def run_project_review(args: argparse.Namespace, rc: remote_client.RemoteConfig, use_remote: bool) -> None:
+    if args.project_review:
+        if use_remote:
+            result, _ = remote_client.request_json(rc, "GET", "/api/v1/project-review")
+            pending = result["suggestions"]
+        else:
+            data_dir = args.data_dir or DEFAULT_DATA_DIR
+            days = load_all_days(data_dir)
+            pending = ProjectCatalog(days, load_registry(data_dir)).suggestions(days)
+        if args.as_json:
+            print(json.dumps({"suggestions": pending}, ensure_ascii=False, indent=2))
+        elif pending:
+            for suggestion in pending[: args.limit]:
+                target = suggestion["suggested"]["project"]
+                print(f"- 「{suggestion['label']}」→「{target}」"
+                      f"（{', '.join(suggestion['dates'])}） {suggestion['reason']}".rstrip())
+        else:
+            print("暂无待确认的项目归类建议。")
+        return
+
+    action = "merge" if args.merge_projects is not None else "split"
+    target, *labels = args.merge_projects if action == "merge" else args.split_project
+    if use_remote:
+        result, _ = remote_client.request_json(
+            rc, "POST", "/api/v1/project-review",
+            json_body={"action": action, "target": target, "labels": labels}, write=True,
+        )
+        project = result["project"]
+    else:
+        data_dir = args.data_dir or DEFAULT_DATA_DIR
+        project = edit_registry(data_dir, load_all_days(data_dir), action, target, labels)
+    if args.as_json:
+        print(json.dumps(project, ensure_ascii=False, indent=2))
+    else:
+        print(f"已保存「{project['project']}」({project['project_id']})")
+        if project["aliases"]:
+            print(f"别名 {'、'.join(project['aliases'])}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="AI memory index generator and fast historical query CLI for daily-summary."
@@ -990,7 +1087,13 @@ def main() -> None:
     parser.add_argument("--index-output", help="Override output path for --rebuild-index.")
     parser.add_argument("--index", action="store_true", help="Print latest MEMORY_INDEX.md (from NAS or local/cache).")
     parser.add_argument("--projects", action="store_true", help="List aggregated projects sorted by latest activity.")
-    parser.add_argument("--project", help="Show chronological timeline for matching project name(s).")
+    parser.add_argument("--project", help="Show a project timeline by name, alias, or stable ID.")
+    decisions = parser.add_mutually_exclusive_group()
+    decisions.add_argument("--project-review", action="store_true", help="List AI suggestions awaiting a decision.")
+    decisions.add_argument("--merge-projects", nargs="+", metavar="PROJECT",
+                           help="Merge one or more names into the first project.")
+    decisions.add_argument("--split-project", nargs="+", metavar="NAME",
+                           help="Restore an alias as a project, or split named aliases into the first name.")
     parser.add_argument("--keyword", "-k", help="Search keyword(s) (space-separated AND terms) across history.")
     parser.add_argument("--date", help="Inspect a specific workday (YYYY-MM-DD).")
     parser.add_argument("--days", type=int, help="Limit search to the most recent N calendar days.")
@@ -1048,6 +1151,13 @@ def main() -> None:
         and (args.remote or rc.configured)
     )
 
+    if args.project_review or args.merge_projects or args.split_project:
+        try:
+            run_project_review(args, rc, use_remote)
+        except (OSError, ValueError, RuntimeError) as exc:
+            parser.exit(2, f"ERROR: {exc}\n")
+        return
+
     offline_notice = ""
     if use_remote:
         try:
@@ -1078,9 +1188,10 @@ def main() -> None:
 
     target_data_dir = args.data_dir or DEFAULT_DATA_DIR
     days = load_all_days(target_data_dir)
+    catalog = ProjectCatalog(days, load_registry(target_data_dir))
 
     if args.index:
-        print(render_memory_index(days, tz_name=str(cfg.get("timezone") or "Asia/Shanghai")))
+        print(render_memory_index(days, tz_name=str(cfg.get("timezone") or "Asia/Shanghai"), catalog=catalog))
         return
 
     if args.rebuild_index:
@@ -1088,6 +1199,7 @@ def main() -> None:
             days,
             output_path=args.index_output or resolve_index_path(cfg),
             tz_name=str(cfg.get("timezone") or "Asia/Shanghai"),
+            catalog=catalog,
         )
         if args.as_json:
             print(json.dumps(stats, ensure_ascii=False, indent=2))
@@ -1107,7 +1219,7 @@ def main() -> None:
         exact_date=args.date,
     )
 
-    if args.date:
+    if args.date and not args.project and not args.keyword:
         res = query_exact_date(
             days,
             args.date,
@@ -1115,6 +1227,7 @@ def main() -> None:
             data_dir=target_data_dir,
             machine_filter=args.machine,
             keyword=args.keyword,
+            catalog=catalog,
         )
         if not res["day"]:
             print(f"No summary found for {args.date}", file=sys.stderr)
@@ -1136,6 +1249,7 @@ def main() -> None:
             data_dir=target_data_dir,
             asc=args.asc,
             limit=args.limit,
+            catalog=catalog,
         )
         if args.as_json:
             print(json.dumps(res, ensure_ascii=False, indent=2))
@@ -1154,6 +1268,7 @@ def main() -> None:
             data_dir=target_data_dir,
             asc=args.asc,
             limit=args.limit,
+            catalog=catalog,
         )
         if args.as_json:
             print(json.dumps(res, ensure_ascii=False, indent=2))
@@ -1167,6 +1282,7 @@ def main() -> None:
         status_filter=args.status,
         machine_filter=args.machine,
         keyword=args.keyword,
+        catalog=catalog,
     )
     if args.as_json:
         print(json.dumps({"total": len(projs), "projects": projs[: args.limit]}, ensure_ascii=False, indent=2))

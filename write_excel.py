@@ -15,6 +15,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 import query_memory
+from project_identity import ProjectCatalog, load_registry
 from provenance import SOURCE_PENDING, format_sources, verify_day_sources
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -953,10 +954,12 @@ def main() -> None:
         idx_res = sync_json_indexes(all_days, data_dir=target_data_dir)
         print(f"Synced JSON indexes: {idx_res}")
         if not args.no_memory_index:
+            history = query_memory.load_all_days(target_data_dir)
             mem_res = query_memory.generate_memory_index(
-                query_memory.load_all_days(target_data_dir),
+                history,
                 output_path=query_memory.resolve_index_path(cfg),
                 tz_name=str(cfg.get("timezone") or "Asia/Shanghai"),
+                catalog=ProjectCatalog(history, load_registry(target_data_dir)),
             )
             print(f"Updated memory index: {mem_res}")
 

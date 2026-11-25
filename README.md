@@ -32,6 +32,22 @@
 
 同一条进展可以保存多个出处。`--raw` 只展开结果中各条进展引用的原始记录。离线缓存仍显示已保存的出处，原始记录不可用时会另行标明。
 
+## 项目身份、别名和纠错
+
+旧日报会按项目名取得稳定的 `project_id`。查询接受主名称、别名或 ID，并按同一个 ID 汇总历史进展。每条进展同时保留入库时的名称，供纠错使用。AI 可以填写 `suggested_project_id` 和 `project_suggestion_reason`，候选 ID 来自采集结果的 `existing_projects`，由你确认是否合并。
+
+```bash
+python3 query_memory.py --project-review
+python3 query_memory.py --merge-projects 'ComfyUI 人像与视频管线' 'comfyui-mcp' '保脸工作流'
+python3 query_memory.py --project '保脸工作流'
+python3 query_memory.py --split-project '保脸工作流'
+```
+
+- 合并保留第一个项目的 ID。被合并的名称和原 ID 都能查到合并后的项目。
+- 拆分可把一个别名恢复为独立项目，也可用 `--split-project '新项目主名称' '已合并的别名 A' '已合并的别名 B'` 将多个别名转到指定项目。拆出的名称会独立归档，包括之前和以后以该名称记录的进展。对尚未合并的候选名称执行拆分，会将其确认为独立项目。
+- 人工决定保存在 `data/project_registry.json`。配置 NAS 时，查询和纠错使用 NAS 上的登记表，纠错需要写权限。本地模式用 `--local` 或 `--data-dir`。用 `--sync-cache` 更新离线副本。
+- 查询立即应用新决定。本地已生成的 `MEMORY_INDEX.md` 随下次日报写入刷新，也可运行 `--rebuild-index` 刷新。Excel 继续展示每条进展的原始项目名称。
+
 ## 目录与脚本
 
 - 配置模板：`config.example.json`（复制为 `config.json` 按需修改；未创建 `config.json` 时自动回退读取模板）

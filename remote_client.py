@@ -14,6 +14,7 @@ from urllib import parse as urlparse
 from urllib import request as urlrequest
 
 import multi_machine
+from project_identity import REGISTRY_FILE
 
 DEFAULT_REMOTE_CONFIG_PATH = os.path.expanduser("~/.daily-memory/remote.json")
 DEFAULT_CACHE_DIR = os.path.expanduser("~/.daily-memory/cache")
@@ -300,7 +301,7 @@ def push_summary(
 
 
 def sync_local_cache(rc: RemoteConfig) -> dict[str, Any]:
-    """Download MEMORY_INDEX.md + summary_all_history.json into local offline cache."""
+    """Download the memory index, history, and project decisions into the offline cache."""
     bundle, ep = request_json(rc, "GET", "/api/v1/bundle", write=False)
     os.makedirs(os.path.join(rc.cache_dir, "data"), exist_ok=True)
     index_md = str(bundle.get("memory_index_md") or "")
@@ -311,6 +312,8 @@ def sync_local_cache(rc: RemoteConfig) -> dict[str, Any]:
     if index_md:
         multi_machine.atomic_write_text(index_path, index_md)
     multi_machine.atomic_write_json(master_path, {"days": days})
+    registry_path = os.path.join(rc.cache_dir, "data", REGISTRY_FILE)
+    multi_machine.atomic_write_json(registry_path, bundle.get("project_registry") or {"projects": []})
     meta = {
         "synced_at": datetime.now(timezone.utc).isoformat(),
         "endpoint_name": ep.name,

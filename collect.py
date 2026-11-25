@@ -15,6 +15,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import multi_machine
+import query_memory
 import remote_client
 
 try:
@@ -1219,12 +1220,14 @@ def collect_local_files(
     return summaries
 
 
-def load_existing_projects(cfg: dict[str, Any]) -> list[dict[str, str]]:
+def load_existing_projects(cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    projects = query_memory.project_candidates(query_memory.DEFAULT_DATA_DIR)
+    if projects:
+        return projects[:60]
     sources = [
         ("work", os.path.expanduser(cfg.get("excel_path", ""))),
         ("personal", os.path.expanduser(cfg.get("personal_excel_path", ""))),
     ]
-    projects: list[dict[str, str]] = []
     try:
         from openpyxl import load_workbook
     except Exception:
