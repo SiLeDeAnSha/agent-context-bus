@@ -84,7 +84,7 @@ def project_candidates(data_dir: str) -> list[dict[str, Any]]:
     catalog = ProjectCatalog(days, load_registry(data_dir))
     projects = aggregate_projects(days, catalog=catalog)
     seen = {p["project_id"] for p in projects}
-    fields = ("project_id", "project", "aliases", "scope", "category", "last_date", "status", "next_step")
+    fields = ("project_id", "project", "aliases", "paths", "scope", "category", "last_date", "status", "next_step")
     candidates = [
         {**{k: p[k] for k in fields}, "sessions": "；".join(p["recent_sessions"])[:160]} for p in projects
     ]
@@ -117,6 +117,17 @@ def clean_cell(text: Any, limit: int = 120) -> str:
     if len(s) <= limit:
         return s
     return s[: limit - 1].rstrip(" ，、；;") + "…"
+
+
+def format_paths_cell(paths: list[str] | None, limit: int = 110) -> str:
+    if not paths:
+        return "-"
+    rendered = "；".join(f"`{clean_cell(p, 72)}`" for p in paths[:3])
+    if len(paths) > 3:
+        rendered += f" 等{len(paths)}处"
+    if len(rendered) <= limit:
+        return rendered
+    return f"`{clean_cell(paths[0], limit - 8)}`" + (f" (+{len(paths) - 1})" if len(paths) > 1 else "")
 
 
 def parse_terms(keyword: str | None) -> list[str]:
@@ -333,15 +344,16 @@ def render_memory_index(
     total_days = len(ordered_days)
 
     lines: list[str] = [
-        "# MEMORY_INDEX · 全项目现行状态快照",
+        "# MEMORY_INDEX · 跨端 AI 记忆中枢（Agent Context Bus）全项目快照",
         "",
-        f"> 由 `daily-summary` 流水线自动生成，请勿手工编辑（下次运行会覆盖）。",
+        "> 由 **跨端 AI 记忆中枢（Agent Context Bus）** 流水线自动生成，请勿手工编辑（下次运行会覆盖）。",
         f"> 覆盖范围：`{first_d}` ~ `{last_d}`（共 **{total_days} 天**）｜ 正式工作：**{len(work_projs)} 项** ｜ 个人技术与折腾：**{len(personal_projs)} 项** ｜ 进行中/待跟进：**{len(active_projs)} 项** ｜ 更新时间：`{now_str}`",
         "",
         "## 按需下钻检索（CLI）",
         "",
-        "- 查某项目完整时间线：`python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --project \"<项目关键词>\"`",
+        "- 查某项目完整时间线与关键路径：`python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --project \"<项目关键词>\"`",
         "- 跨项目/随想搜关键词（加 `--raw` 可查会话 UUID、用户指令、Git 提交与改动文件）：`python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --keyword \"<关键词>\" --raw`",
+        "- 为项目登记/更新物理目录与关键配置文件：`python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --add-path \"<项目名>\" \"<路径1>\" \"<路径2>\"`",
         "",
     ]
 
@@ -350,15 +362,15 @@ def render_memory_index(
             [
                 "## 活跃与待跟进项目（置顶）",
                 "",
-                "| 维度 | 项目名称 | 最近更新 | 状态 | 下一步 / 卡点 | 最近进展摘要 |",
-                "|---|---|---|---|---|---|",
+                "| 维度 | 项目名称 | 最近更新 | 状态 | 关键路径 | 下一步 / 卡点 | 最近进展摘要 |",
+                "|---|---|---|---|---|---|---|",
             ]
         )
         for p in active_projs:
             scope_lbl = "正式工作" if p["scope"] == "work" else "个人技术"
             lines.append(
                 f"| {scope_lbl} | {clean_cell(p['project'], 48)} | `{p['last_date']}` ({p['days']}d) "
-                f"| {clean_cell(p['status'], 16)} | {clean_cell(p['next_step'], 60)} "
+                f"| {clean_cell(p['status'], 16)} | {format_paths_cell(p.get('paths'))} | {clean_cell(p['next_step'], 60)} "
                 f"| {clean_cell(p['latest_summary'], 110)} |"
             )
         lines.append("")
@@ -370,8 +382,8 @@ def render_memory_index(
             return
         lines.extend(
             [
-                "| 项目名称 | 分类 | 覆盖日期（天数） | 状态 | 下一步 / 卡点 | 最近进展与关键产出 |",
-                "|---|---|---|---|---|---|",
+                "| 项目名称 | 分类 | 覆盖日期（天数） | 状态 | 关键路径 | 下一步 / 卡点 | 最近进展与关键产出 |",
+                "|---|---|---|---|---|---|---|",
             ]
         )
         for p in projs:
@@ -387,7 +399,7 @@ def render_memory_index(
                     detail = f"{detail}（产出：{out_str}）"
             lines.append(
                 f"| {clean_cell(p['project'], 46)} | {clean_cell(p['category'], 20)} | {span} "
-                f"| {clean_cell(p['status'], 14)} | {clean_cell(p['next_step'], 52)} "
+                f"| {clean_cell(p['status'], 14)} | {format_paths_cell(p.get('paths'))} | {clean_cell(p['next_step'], 52)} "
                 f"| {clean_cell(detail, 115)} |"
             )
         lines.append("")
@@ -639,7 +651,7 @@ def query_keyword(
                     str(it.get(k) or "")
                     for k in ("project", "category", "tool", "machine", "session_name", "summary", "outputs", "next_step")
                 )
-                names = " ".join([identity["project"], *identity["aliases"]])
+                names = " ".join([identity["project"], *identity["aliases"], *(identity.get("paths") or [])])
                 if identity == exact_project or matches_terms(f"{blob} {names}", terms):
                     day_matched = True
                     hits.append(
@@ -734,7 +746,7 @@ def query_projects(
             p
             for p in projs
             if matches_terms(
-                f"{p['project']} {' '.join(p['aliases'])} {p['project_id']} "
+                f"{p['project']} {' '.join(p['aliases'])} {' '.join(p.get('paths') or [])} {p['project_id']} "
                 f"{p['category']} {p['latest_summary']} {p['next_step']}",
                 terms,
             )
@@ -868,8 +880,8 @@ def format_projects_md(projs: list[dict[str, Any]], limit: int = 50) -> str:
         return "\n".join(lines)
     lines.extend(
         [
-            "| 维度 | 项目名称 | 覆盖日期（天数） | 状态 | 下一步 / 卡点 | 最近进展 |",
-            "|---|---|---|---|---|---|",
+            "| 维度 | 项目名称 | 覆盖日期（天数） | 状态 | 关键路径 | 下一步 / 卡点 | 最近进展 |",
+            "|---|---|---|---|---|---|---|",
         ]
     )
     for p in sliced:
@@ -877,7 +889,7 @@ def format_projects_md(projs: list[dict[str, Any]], limit: int = 50) -> str:
         mach_suffix = f" `@{p['last_machine']}`" if p.get("last_machine") else ""
         lines.append(
             f"| {scope_lbl} | {clean_cell(p['project'], 44)}{mach_suffix} | `{p['first_date']}`~`{p['last_date']}` ({p['days']}d) "
-            f"| {clean_cell(p['status'], 14)} | {clean_cell(p['next_step'], 50)} | {clean_cell(p['latest_summary'], 100)} |"
+            f"| {clean_cell(p['status'], 14)} | {format_paths_cell(p.get('paths'))} | {clean_cell(p['next_step'], 50)} | {clean_cell(p['latest_summary'], 100)} |"
         )
     return "\n".join(lines)
 
@@ -899,6 +911,8 @@ def format_project_query_md(res: dict[str, Any]) -> str:
         lines.append(f"> 项目 ID：`{project['project_id']}`")
         if project["aliases"]:
             lines.append(f"> 别名：{'、'.join(project['aliases'])}")
+        if project.get("paths"):
+            lines.append(f"> 关键路径：{' ； '.join(f'`{p}`' for p in project['paths'])}")
     lines.append("")
     if not res["entries"]:
         lines.append("_无匹配记录_")
@@ -1068,8 +1082,21 @@ def run_project_review(args: argparse.Namespace, rc: remote_client.RemoteConfig,
             print("暂无待确认的项目归类建议。")
         return
 
-    action = "merge" if args.merge_projects is not None else "split"
-    target, *labels = args.merge_projects if action == "merge" else args.split_project
+    if args.merge_projects is not None:
+        action = "merge"
+        target, *labels = args.merge_projects
+    elif args.split_project is not None:
+        action = "split"
+        target, *labels = args.split_project
+    elif args.add_path is not None:
+        action = "add_paths"
+        target, *labels = args.add_path
+    elif args.remove_path is not None:
+        action = "remove_paths"
+        target, *labels = args.remove_path
+    else:
+        action = "set_paths"
+        target, *labels = args.set_paths
     if use_remote:
         result, _ = remote_client.request_json(
             rc, "POST", "/api/v1/project-review",
@@ -1085,6 +1112,8 @@ def run_project_review(args: argparse.Namespace, rc: remote_client.RemoteConfig,
         print(f"已保存「{project['project']}」({project['project_id']})")
         if project["aliases"]:
             print(f"别名 {'、'.join(project['aliases'])}")
+        if project.get("paths"):
+            print(f"关键路径 {' ； '.join(project['paths'])}")
 
 
 def main() -> None:
@@ -1103,6 +1132,12 @@ def main() -> None:
                            help="Merge one or more names into the first project.")
     decisions.add_argument("--split-project", nargs="+", metavar="NAME",
                            help="Restore an alias as a project, or split named aliases into the first name.")
+    decisions.add_argument("--add-path", nargs="+", metavar="ARG",
+                           help="Attach one or more physical directories or key config paths to a project (PROJECT PATH ...).")
+    decisions.add_argument("--remove-path", nargs="+", metavar="ARG",
+                           help="Remove one or more paths from a project (PROJECT PATH ...).")
+    decisions.add_argument("--set-paths", nargs="+", metavar="ARG",
+                           help="Replace a project's registered paths (PROJECT [PATH ...]; omit PATH to clear).")
     parser.add_argument("--keyword", "-k", help="Search keyword(s) (space-separated AND terms) across history.")
     parser.add_argument("--date", help="Inspect a specific workday (YYYY-MM-DD).")
     parser.add_argument("--days", type=int, help="Limit search to the most recent N calendar days.")
@@ -1160,7 +1195,14 @@ def main() -> None:
         and (args.remote or rc.configured)
     )
 
-    if args.project_review or args.merge_projects or args.split_project:
+    if (
+        args.project_review
+        or args.merge_projects
+        or args.split_project
+        or args.add_path
+        or args.remove_path
+        or args.set_paths
+    ):
         try:
             run_project_review(args, rc, use_remote)
         except (OSError, ValueError, RuntimeError) as exc:

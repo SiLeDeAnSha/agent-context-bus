@@ -1,6 +1,6 @@
-# DailyReport · AI 历史工作与技术记忆库入口
+# DailyReport · 跨端 AI 记忆中枢（Agent Context Bus）入口
 
-本目录是本地自动化日报系统（每日采集 Antigravity / Codex / WorkBuddy / T3 Code 四端轨迹）的输出目录，可作为跨端 AI 的**情景记忆库与项目现行状态索引**使用。
+本目录是本地优先的跨端 AI 记忆中枢（Agent Context Bus，每日采集 Antigravity / Codex / WorkBuddy / T3 Code 四端轨迹）的输出目录，为所有客户端提供统一的**情景记忆库、项目关键路径与现行状态索引**。
 
 ## 1. AI 读取优先级（重要）
 
@@ -18,10 +18,13 @@
    - 按维度/时间窗口过滤：
      `python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --projects --scope personal --days 14`
      `python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --date YYYY-MM-DD --raw`
-   - 审核/合并/拆分重名项目别名（v0.2.0，配置 NAS 时自动走 NAS 登记表）：
+   - 审核/合并/拆分重名项目别名与登记项目物理路径（配置 NAS 时自动走 NAS 登记表）：
      `python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --project-review`
      `python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --merge-projects "<主项目名>" "<别名>"`
      `python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --split-project "<别名>"`
+     `python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --add-path "<项目名>" "<物理目录或配置文件路径>"`
+     `python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --remove-path "<项目名>" "<路径>"`
+     `python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --set-paths "<项目名>" "<路径1>" "<路径2>"`
    - 检索本机原会话原文片段（v0.2.0，当摘要和 `--raw` 省略具体命令/报错原文时按出处会话 ID 下钻）：
      `python3 ~/.gemini/antigravity/scratch/daily-summary/search_sessions.py --keyword "<原文关键词>" --session-id "<会话 ID>"`
 3. **直接读结构化底层数据（需自定义统计或二次分析时）**：

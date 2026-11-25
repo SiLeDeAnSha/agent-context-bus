@@ -224,6 +224,80 @@ class DailySummaryTests(unittest.TestCase):
             self.assertEqual(history[0]["work_items"][1]["project"], alias)
             self.assertEqual(query_memory.project_candidates(data_dir)[0]["project_id"], face_id)
 
+    def test_project_registry_paths_merge_render_and_search(self) -> None:
+        days = [
+            {
+                "workday": "2026-11-24",
+                "weekday": "周二",
+                "work_items": [
+                    {
+                        "scope": "personal",
+                        "project": "代理分流规则优化",
+                        "category": "网络与客户端配置",
+                        "tool": "Antigravity",
+                        "session_name": "规则优化",
+                        "summary": "更新分流规则",
+                        "outputs": "script.js",
+                        "status": "进行中",
+                        "next_step": "验证出口IP",
+                    },
+                    {
+                        "scope": "personal",
+                        "project": "proxy-legacy",
+                        "category": "网络与客户端配置",
+                        "tool": "Codex",
+                        "session_name": "旧规则",
+                        "summary": "旧脚本",
+                        "outputs": "-",
+                        "status": "已完成",
+                        "next_step": "-",
+                    },
+                ],
+                "life_items": [],
+            }
+        ]
+        with tempfile.TemporaryDirectory() as data_dir:
+            p1 = edit_registry(data_dir, days, "add_paths", "代理分流规则优化", ["~/projects/proxy-rules"])
+            self.assertEqual(p1["paths"], ["~/projects/proxy-rules"])
+            p2 = edit_registry(data_dir, days, "add_paths", "proxy-legacy", ["~/clash/script.js"])
+            self.assertEqual(p2["paths"], ["~/clash/script.js"])
+
+            # Merge unions paths from both projects without duplicates
+            merged = edit_registry(data_dir, days, "merge", "代理分流规则优化", ["proxy-legacy"])
+            self.assertEqual(
+                merged["paths"],
+                ["~/projects/proxy-rules", "~/clash/script.js"],
+            )
+
+            # Remove & set paths work via project_id or alias
+            removed = edit_registry(data_dir, days, "remove_paths", merged["project_id"], ["~/clash/script.js"])
+            self.assertEqual(removed["paths"], ["~/projects/proxy-rules"])
+            replaced = edit_registry(
+                data_dir,
+                days,
+                "set_paths",
+                "proxy-legacy",
+                ["~/projects/proxy-rules", "~/clash/script.js"],
+            )
+            self.assertEqual(len(replaced["paths"]), 2)
+
+            catalog = ProjectCatalog(days, load_registry(data_dir))
+            md = query_memory.render_memory_index(days, catalog=catalog)
+            self.assertIn("Agent Context Bus", md)
+            self.assertIn("关键路径", md)
+            self.assertIn("~/projects/proxy-rules", md)
+
+            tl = query_memory.query_by_project(days, "代理分流", data_dir=data_dir)
+            tl_md = query_memory.format_project_query_md(tl)
+            self.assertIn("关键路径", tl_md)
+            self.assertIn("~/clash/script.js", tl_md)
+
+            kw = query_memory.query_keyword(days, "proxy-rules", data_dir=data_dir)
+            self.assertEqual(kw["total_matches"], 2)
+            projs = query_memory.query_projects(days, keyword="proxy-rules", catalog=catalog)
+            self.assertEqual(len(projs), 1)
+            self.assertEqual(projs[0]["paths"], ["~/projects/proxy-rules", "~/clash/script.js"])
+
     def test_workday_boundary_5am(self) -> None:
         tz = ZoneInfo("Asia/Shanghai")
         start, end = collect.workday_bounds("2026-11-21", "Asia/Shanghai", 5)

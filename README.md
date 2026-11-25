@@ -1,6 +1,8 @@
-# 日迹 · 每日工作汇总 (Daily Summary)
+# 跨端 AI 记忆中枢 · Agent Context Bus
 
-自动采集本地 **Antigravity / Codex / WorkBuddy / T3 Code** 多端工作轨迹（其中 T3 Code 通过 `statev2.sqlite` 按实际 Provider 自动归口并与 Codex 去重），支持定时任务触发，并**严格分离为两份独立 Excel 总表**：
+> 本地优先的跨 Agent 记忆层与项目上下文总线（原「日迹 · Daily Summary」），统一打通 **Antigravity / Codex / WorkBuddy / T3 Code / Claude Code** 的历史进度、物理路径与原始会话溯源。
+
+自动采集本地 **Antigravity / Codex / WorkBuddy / T3 Code** 多端工作轨迹（其中 T3 Code 通过 `statev2.sqlite` 按实际 Provider 自动归口并与 Codex 去重），沉淀四层渐进式检索记忆（L0 全局规则入口 → L1 `MEMORY_INDEX.md` 全项目快照 → L2 `query_memory.py` 结构化时间线与项目路径注册表 → L3 `search_sessions.py` 原始会话全文溯源），并支持定时任务触发，**严格分离为两份独立 Excel 总表**：
 
 1. **正式工作表**：`~/Documents/DailyReport/每日工作汇总.xlsx`（3 个 Sheet：`每日概览`、`项目总览`、`项目流程明细`）
    - 收录正式业务工作（公文材料、海报排版、内容统计、视频制作等）。
@@ -51,22 +53,29 @@ python3 search_sessions.py --keyword 'ffprobe' --client codex --date 2026-11-24 
 
 按字面匹配关键词，忽略大小写。默认只返回最近 5 个命中片段，附会话 ID、时间和原文件位置。可用 `--from`、`--to` 限定工作日范围，或用 `--json` 输出结构化结果。检索覆盖本机 Antigravity 完整转录、Codex 活跃及归档会话、WorkBuddy 项目日志和 T3 Code 会话数据库中的消息、命令与工具输出。Codex 的 `.zst` 归档需要 Python 3.14+ 或 Python 的 `zstandard` 包。
 
-## 项目身份、别名和纠错
+## 项目身份、别名、物理路径和纠错
 
-旧日报会按项目名取得稳定的 `project_id`。查询接受主名称、别名或 ID，并按同一个 ID 汇总历史进展。每条进展同时保留入库时的名称，供纠错使用。AI 可以填写 `suggested_project_id` 和 `project_suggestion_reason`，候选 ID 来自采集结果的 `existing_projects`，由你确认是否合并。
+旧日报会按项目名取得稳定的 `project_id`。查询接受主名称、别名、ID 或已登记的物理路径，并按同一个 ID 汇总历史进展。每条进展同时保留入库时的名称，供纠错使用。AI 可以填写 `suggested_project_id` 和 `project_suggestion_reason`，候选 ID 来自采集结果的 `existing_projects`，由你确认是否合并。
+
+项目注册表同时支持固定记录 `paths`（物理目录与关键配置文件路径），写入后直接呈现在 `MEMORY_INDEX.md`、`--projects` 与 `--project` 顶部，并纳入 `--keyword` / `--projects` 检索，省去每次跨端续做前全盘找路径的开销。
 
 ```bash
 python3 query_memory.py --project-review
 python3 query_memory.py --merge-projects 'ComfyUI 人像与视频管线' 'comfyui-mcp' '保脸工作流'
 python3 query_memory.py --project '保脸工作流'
 python3 query_memory.py --split-project '保脸工作流'
+
+# 为项目登记、移除或覆盖物理目录与关键配置文件路径
+python3 query_memory.py --add-path '代理分流规则优化' '~/projects/proxy-rules' '~/.config/clash/script.js'
+python3 query_memory.py --remove-path '代理分流规则优化' '~/projects/old-rules'
+python3 query_memory.py --set-paths '代理分流规则优化' '~/projects/proxy-rules'
 ```
 
 也可以用合并前的别名 ID 拆分，拆出后保留原有名称和 ID。
 
-- 合并保留第一个项目的 ID。被合并的名称和原 ID 都能查到合并后的项目。
+- 合并保留第一个项目的 ID，并自动合并去重双方的 `paths`。被合并的名称和原 ID 都能查到合并后的项目。
 - 拆分可把一个别名恢复为独立项目，也可用 `--split-project '新项目主名称' '已合并的别名 A' '已合并的别名 B'` 将多个别名转到指定项目。拆出的名称会独立归档，包括之前和以后以该名称记录的进展。对尚未合并的候选名称执行拆分，会将其确认为独立项目。
-- 人工决定保存在 `data/project_registry.json`。配置 NAS 时，查询和纠错使用 NAS 上的登记表，纠错需要写权限。本地模式用 `--local` 或 `--data-dir`。用 `--sync-cache` 更新离线副本。
+- 人工决定与 `paths` 保存在 `data/project_registry.json`。配置 NAS 时，查询、路径登记与纠错均走 NAS 登记表（写操作需写权限）。本地模式用 `--local` 或 `--data-dir`。用 `--sync-cache` 更新离线副本。
 - 查询立即应用新决定。本地已生成的 `MEMORY_INDEX.md` 随下次日报写入刷新，也可运行 `--rebuild-index` 刷新。Excel 继续展示每条进展的原始项目名称。
 
 ## 目录与脚本

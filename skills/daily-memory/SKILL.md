@@ -1,11 +1,11 @@
 ---
 name: daily-memory
-description: 检索与维护跨端 AI 历史工作与技术记忆库（Antigravity / Codex / WorkBuddy / T3 Code）：秒查项目最新进度、按关键词/时间线/原始会话 UUID 与 Git 提交溯源、跨工具接力续做、刷新或补跑自动化日报、导出脱敏对外周报/日报，以及一键幂等同步各 AI 客户端全局记忆规则。触发词：找一下之前弄的、接着之前的继续、上次做到哪了、查历史记录、刷新日报、补跑日报、导出周报、同步记忆规则、daily-memory。
+description: 跨端 AI 记忆中枢（Agent Context Bus）检索与维护 skill（Antigravity / Codex / WorkBuddy / T3 Code）：秒查项目最新进度与物理路径、按关键词/时间线/原始会话 UUID 与 Git 提交溯源、跨工具接力续做、登记项目目录与配置文件路径、刷新或补跑自动化日报、导出脱敏对外周报/日报，以及一键幂等同步各 AI 客户端全局记忆规则。触发词：找一下之前弄的、接着之前的继续、上次做到哪了、查历史记录、刷新日报、补跑日报、导出周报、同步记忆规则、跨端 AI 记忆中枢、Agent Context Bus、daily-memory。
 ---
 
-# Daily Memory · 跨端历史工作与技术记忆库
+# 跨端 AI 记忆中枢 · Agent Context Bus（Daily Memory）
 
-基于本地自动化日报流水线（`~/.gemini/antigravity/scratch/daily-summary/`）与输出目录（`~/Documents/DailyReport/`），为 Antigravity、Codex、Claude Code、WorkBuddy、T3 Code 提供统一的跨端情景记忆与项目现行状态索引。
+基于本地优先的跨端 AI 记忆中枢（`~/.gemini/antigravity/scratch/daily-summary/`）与输出目录（`~/Documents/DailyReport/`），为 Antigravity、Codex、Claude Code、WorkBuddy、T3 Code 提供统一的情景记忆、项目关键路径与现行状态索引。
 
 ## 核心铁律
 
@@ -122,23 +122,28 @@ python3 ~/.gemini/antigravity/scratch/daily-summary/collect.py --yesterday --mis
 
 ---
 
-## 工作流 F：项目身份、别名合并/拆分与首次导入向导（v0.2.0）
+## 工作流 F：项目身份、别名、物理路径登记与首次导入向导
 
-旧日报与新日报统一按稳定 `project_id` 聚合，查询接受主名称、别名或 ID。仅当用户明确要求整理重名项目、审核 AI 合并建议或重跑首次导入时执行写操作：
+旧日报与新日报统一按稳定 `project_id` 聚合，查询接受主名称、别名、ID 或已登记路径。仅当用户明确要求整理重名项目、登记项目关键路径、审核 AI 合并建议或重跑首次导入时执行写操作：
 
 ```bash
 # 1. 查看 AI 建议合并的重名/候选项目（只读）
 python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --project-review
 
-# 2. 合并项目别名（保留第一个项目的 ID；写操作，配置 NAS 时自动走 NAS 并需写权限）
+# 2. 合并项目别名（保留第一个项目的 ID 并自动合并去重双方 paths；写操作，配置 NAS 时自动走 NAS 并需写权限）
 python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --merge-projects "<主项目名>" "<别名1>" "<别名2>"
 
 # 3. 拆分误合并别名，或将候选名称确认为独立项目
 python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --split-project "<别名>"
 python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --split-project "<新项目主名称>" "<已合并别名A>" "<已合并别名B>"
 
+# 4. 登记、移除或覆盖项目的物理目录 / 关键配置文件路径（会直接呈现在 MEMORY_INDEX.md 与 --project 顶部）
+python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --add-path "<项目名>" "<路径1>" "<路径2>"
+python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --remove-path "<项目名>" "<路径>"
+python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --set-paths "<项目名>" "<路径1>" "<路径2>"
+
 # 如需仅操作本机登记表，加 --local 或 --data-dir；更新后按需 --rebuild-index / --sync-cache
 
-# 4. 首次导入终端向导（检查本机 4 端可读历史并导入近 7 天到 data/first-import/，不影响正式日报）
+# 5. 首次导入终端向导（检查本机 4 端可读历史并导入近 7 天到 data/first-import/，不影响正式日报）
 python3 ~/.gemini/antigravity/scratch/daily-summary/onboarding.py
 ```
