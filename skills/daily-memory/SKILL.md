@@ -76,15 +76,41 @@ python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --rebuild-in
 
 **注意**：日常查记忆时不要触发本流程。仅在用户要求“把记忆库接到各端 / 同步全局规则 / 换机初始化”时执行。
 
-同步脚本通过 `<!-- DAILY-SUMMARY START -->` … `<!-- DAILY-SUMMARY END -->` 锚点幂等更新，绝不改动锚点外的其他规则：
+同步脚本通过 `<!-- DAILY-SUMMARY START -->` … `<!-- DAILY-SUMMARY END -->` 锚点幂等更新，绝不改动锚点外的其他规则（如 `FLUE` 区块或个人档案内容）：
 
 ```bash
 # 1. 先只读检查四端（Antigravity / Codex / Claude / WorkBuddy）规则与 Skill 软链状态
-python3 scripts/sync_global_rules.py --check
+python3 ~/.cc-switch/skills/daily-memory/scripts/sync_global_rules.py --check
 
 # 2. 幂等同步四端全局规则并补齐各端 daily-memory Skill 软链
-python3 scripts/sync_global_rules.py --sync-skills
+python3 ~/.cc-switch/skills/daily-memory/scripts/sync_global_rules.py --sync-skills
 ```
 
-- 规则目标文件：`~/.gemini/GEMINI.md`、`~/.codex/AGENTS.md`、`~/.claude/CLAUDE.md`、`~/.workbuddy/USER.md`。
+- 规则目标文件：
+  - Antigravity: `~/.gemini/GEMINI.md`
+  - Codex: `~/.codex/AGENTS.md`
+  - Claude Code: `~/.claude/CLAUDE.md`
+  - WorkBuddy: `~/.workbuddy/USER.md`
 - 若需仅同步指定端，可加 `--targets codex,claude`；先预览变更可加 `--dry-run`。
+
+---
+
+## 工作流 E：飞牛 NAS 跨电脑中心模式（多端点自动切换 + Remote MCP）
+
+当配置了 `~/.daily-memory/remote.json` 或 `DAILY_MEMORY_URLS` 时，`query_memory.py` 自动按 **LAN → Tailscale/组网 → IPv6 HTTPS → IPv4 公网 HTTPS** 优先级切换访问飞牛 NAS，全部离线时自动降级读取本地缓存（`~/.daily-memory/cache/`）：
+
+```bash
+# 探测全部网络线路延迟与连通性
+python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --probe
+
+# 同步 NAS 最新 MEMORY_INDEX.md 与全量历史到本地离线缓存
+python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --sync-cache
+
+# 按来源主机筛选（如只看 Mac 或 Windows 台式机记录）
+python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --project "gpu-broker" --machine win-desktop --raw
+
+# 本机采集并推送 raw 分片到飞牛 NAS（由 NAS 定时 LLM 融合汇总，无多机写入冲突）
+python3 ~/.gemini/antigravity/scratch/daily-summary/collect.py --yesterday --missing --machine macbook-pro --push
+```
+
+- 部署脚本与配置模板位于 `~/.gemini/antigravity/scratch/daily-summary/deploy/`（含 `nas_deploy.sh`、`NAS_DEPLOYMENT.md`、`mcp_client_examples.json`）。

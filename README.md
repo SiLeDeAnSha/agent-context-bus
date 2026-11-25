@@ -27,7 +27,12 @@
 - 配置模板：`config.example.json`（复制为 `config.json` 按需修改；未创建 `config.json` 时自动回退读取模板）
 - 采集脚本：`collect.py`（支持 `--yesterday --missing` 自动补齐漏跑日期）
 - 写表脚本：`write_excel.py`（自动按 `scope: "work" | "personal"` 写入两份独立总表，并在同步 JSON 索引后自动原子刷新 `MEMORY_INDEX.md`）
-- AI 记忆索引与检索 CLI：`query_memory.py`（零外部依赖，支持生成 `~/Documents/DailyReport/MEMORY_INDEX.md` 现状快照，以及按项目/关键词/日期/`--raw` 原始会话与 Git 溯源检索）
+- AI 记忆索引与检索 CLI：`query_memory.py`（零外部依赖，支持生成 `~/Documents/DailyReport/MEMORY_INDEX.md` 现状快照、按项目/关键词/日期/主机/`--raw` 原始会话与 Git 溯源检索，以及远程多端点自动故障切换 + 断网本地缓存降级）
+- 跨电脑 NAS 中心服务（fnOS / Docker）：`server/`（`app.py`、`Dockerfile`、`docker-compose.yml`、`.env.example`）与 `multi_machine.py`、`remote_client.py`、`summarizer.py`：
+  - 按 `machine_id` 分片上报防冲突合并（支持 Mac + Windows 同日协同）；
+  - REST API + Remote MCP（Streamable HTTP `POST /mcp`）+ 读写分离 Bearer Token + IP 限流 + 双栈 HTTP/HTTPS；
+  - NAS 端定时调用 OpenAI 兼容 LLM 接口融合多机原始轨迹并自动更新双 Excel、`summary_all_history.json` 与 `MEMORY_INDEX.md`。
+- 部署与多端接入脚本：`deploy/`（`nas_deploy.sh` 一键 SSH 部署与存量迁移、`setup_mac_collector.sh`、`setup_windows_collector.ps1`、`remote.example.json`、`mcp_client_examples.json`、`NAS_DEPLOYMENT.md`）
 - 跨端 AI Skill 与规则装配：`skills/daily-memory/`（内置 `SKILL.md` 与 `scripts/sync_global_rules.py`，可一键幂等同步 Antigravity / Codex / Claude Code / WorkBuddy 四端全局记忆规则与 Skill 软链）
 - 输出目录入口模板：`templates/DailyReport_README.md`（复制到 `~/Documents/DailyReport/README.md` 作为跨端 AI 读取契约）
 - 对外周报/日报导出：`export_report.py`（基于正式工作表导出脱敏 Markdown 周报/日报）

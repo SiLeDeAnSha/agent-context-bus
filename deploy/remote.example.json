@@ -1,0 +1,28 @@
+{
+  "machine_id": "macbook-pro",
+  "endpoints": [
+    {
+      "name": "lan",
+      "url": "http://192.168.1.100:8765",
+      "timeout": 1.2
+    },
+    {
+      "name": "tailscale",
+      "url": "http://100.64.0.10:8765",
+      "timeout": 2.5
+    },
+    {
+      "name": "ipv6-https",
+      "url": "https://nas-v6.yourdomain.com:8443",
+      "timeout": 4.0
+    },
+    {
+      "name": "ipv4-https",
+      "url": "https://mem.yourdomain.com",
+      "timeout": 5.0
+    }
+  ],
+  "read_token": "PASTE_DAILY_MEMORY_READ_TOKEN",
+  "write_token": "PASTE_DAILY_MEMORY_WRITE_TOKEN_OR_LEAVE_EMPTY_FOR_READONLY",
+  "cache_dir": "~/.daily-memory/cache"
+}

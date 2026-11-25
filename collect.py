@@ -3,9 +3,9 @@
 
 import argparse
 from collections import defaultdict
-from compression import zstd
 from datetime import datetime, timedelta, timezone
 import glob
+import io
 import json
 import os
 import re
@@ -14,23 +14,43 @@ import subprocess
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import multi_machine
+import remote_client
+
+try:
+    from compression import zstd as _stdlib_zstd  # Python 3.14+
+except ImportError:
+    _stdlib_zstd = None
+
+try:
+    import zstandard as _thirdparty_zstd  # type: ignore[import-not-found]
+except ImportError:
+    _thirdparty_zstd = None
+
+
+def open_zstd_text(path: str):
+    """Open a .zst file as UTF-8 text on both Python 3.14+ and older Python versions."""
+    if _stdlib_zstd is not None:
+        return _stdlib_zstd.open(path, "rt", encoding="utf-8")
+    if _thirdparty_zstd is not None:
+        raw = open(path, "rb")
+        dctx = _thirdparty_zstd.ZstdDecompressor()
+        reader = dctx.stream_reader(raw, closefd=True)
+        return io.TextIOWrapper(reader, encoding="utf-8")
+    raise RuntimeError("zstd decompression requires Python 3.14+ or `pip install zstandard`.")
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
-EXAMPLE_CONFIG_PATH = os.path.join(BASE_DIR, "config.example.json")
 DATA_DIR = os.path.join(BASE_DIR, "data")
+
+
+EXAMPLE_CONFIG_PATH = os.path.join(BASE_DIR, "config.example.json")
 
 
 def load_config() -> dict[str, Any]:
     path = CONFIG_PATH if os.path.exists(CONFIG_PATH) else EXAMPLE_CONFIG_PATH
     with open(path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-    for k in ("excel_path", "personal_excel_path", "export_dir"):
-        if isinstance(cfg.get(k), str):
-            cfg[k] = os.path.expanduser(cfg[k])
-    for k in ("scan_dirs", "git_search_roots", "exclude_paths"):
-        if isinstance(cfg.get(k), list):
-            cfg[k] = [os.path.expanduser(p) if isinstance(p, str) else p for p in cfg[k]]
-    return cfg
+        return json.load(f)
 
 
 def parse_iso_dt(value: str) -> datetime | None:
@@ -487,7 +507,7 @@ def collect_codex(
 
         try:
             opener = (
-                (lambda p: zstd.open(p, "rt", encoding="utf-8"))
+                (lambda p: open_zstd_text(p))
                 if path.endswith(".zst")
                 else (lambda p: open(p, "r", encoding="utf-8"))
             )
@@ -1246,10 +1266,11 @@ def load_existing_projects(cfg: dict[str, Any]) -> list[dict[str, str]]:
     return projects[:60]
 
 
-def collect_day(workday: str, cfg: dict[str, Any]) -> dict[str, Any]:
+def collect_day(workday: str, cfg: dict[str, Any], machine_id: str | None = None) -> dict[str, Any]:
     tz_name = cfg["timezone"]
     tz = ZoneInfo(tz_name)
     start_dt, end_dt = workday_bounds(workday, tz_name, int(cfg["day_start_hour"]))
+    mid = multi_machine.normalize_machine_id(machine_id or cfg.get("machine_id"))
 
     ag_items, ag_ts = collect_antigravity(start_dt, end_dt, tz, workday, cfg)
     codex_items, codex_ts = collect_codex(start_dt, end_dt, tz, workday, cfg)
@@ -1285,6 +1306,7 @@ def collect_day(workday: str, cfg: dict[str, Any]) -> dict[str, Any]:
     payload = {
         "workday": workday,
         "weekday": weekday_cn,
+        "machine": mid,
         "window_local": f"{start_dt.strftime('%Y-%m-%d %H:%M')} ~ {end_dt.strftime('%Y-%m-%d %H:%M')} ({tz_name})",
         "overall_active_span": format_span(all_ts, tz, workday),
         "overall_estimated_hours": estimate_active_hours(all_ts, gap_min),
@@ -1301,19 +1323,18 @@ def collect_day(workday: str, cfg: dict[str, Any]) -> dict[str, Any]:
             "git_repos": len(git_items),
             "file_groups": len(file_groups),
         },
-        "antigravity": ag_items,
-        "codex": codex_items,
-        "workbuddy": wb_items,
-        "t3_other": t3_other,
-        "git": git_items,
-        "files": file_groups,
+        "antigravity": multi_machine.tag_items_with_machine(ag_items, mid),
+        "codex": multi_machine.tag_items_with_machine(codex_items, mid),
+        "workbuddy": multi_machine.tag_items_with_machine(wb_items, mid),
+        "t3_other": multi_machine.tag_items_with_machine(t3_other, mid),
+        "git": multi_machine.tag_items_with_machine(git_items, mid),
+        "files": multi_machine.tag_items_with_machine(file_groups, mid),
     }
 
     raw_month_dir = os.path.join(DATA_DIR, "raw", workday[:7])
     os.makedirs(raw_month_dir, exist_ok=True)
     out_path = os.path.join(raw_month_dir, f"raw_{workday}.json")
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    multi_machine.atomic_write_json(out_path, payload)
     return payload
 
 
@@ -1482,7 +1503,7 @@ def collect_all_history_single_pass(cfg: dict[str, Any], end_workday: str) -> li
         is_self = False
         try:
             opener = (
-                (lambda p: zstd.open(p, "rt", encoding="utf-8"))
+                (lambda p: open_zstd_text(p))
                 if path.endswith(".zst")
                 else (lambda p: open(p, "r", encoding="utf-8"))
             )
@@ -1755,7 +1776,13 @@ def main() -> None:
     parser.add_argument("--lookback-days", type=int, help="Lookback days for --missing (default from config).")
     parser.add_argument("--days", type=int, help="Collect N workdays ending at --date (or current workday).")
     parser.add_argument("--all-history", action="store_true", help="Single-pass extract all historical AG/Codex days through end workday.")
+    parser.add_argument("--machine", help="Machine identifier for multi-device sharding (default: env/config/hostname).")
+    parser.add_argument("--push", action="store_true", help="Push collected raw payload(s) to the configured remote NAS hub.")
+    parser.add_argument("--remote-config", help="Path to remote.json override when using --push.")
     args = parser.parse_args()
+
+    rc = remote_client.load_remote_config(args.remote_config, project_cfg=cfg) if args.push else None
+    machine_id = multi_machine.normalize_machine_id(args.machine or (rc.machine_id if rc else cfg.get("machine_id")))
 
     cur_wd = current_workday(cfg["timezone"], int(cfg["day_start_hour"]))
     cur_d = datetime.strptime(cur_wd, "%Y-%m-%d").date()
@@ -1791,14 +1818,18 @@ def main() -> None:
 
     print("TARGET_DATES:" + ",".join(dates))
     for d in dates:
-        p = collect_day(d, cfg)
+        p = collect_day(d, cfg, machine_id=machine_id)
         c = p["counts"]
         t3o = c.get("t3_other_sessions", 0)
         t3o_part = f", T3Other={t3o}" if t3o else ""
+        push_part = ""
+        if args.push and rc is not None:
+            res, ep = remote_client.push_raw(rc, p, machine_id=machine_id)
+            push_part = f" | PUSHED->{ep.name} (machines={','.join(res.get('machines', []))})"
         print(
-            f"{d} ({p['weekday']}): AG={c['antigravity_sessions']}, Codex={c['codex_sessions']}, "
+            f"{d} ({p['weekday']}) [{machine_id}]: AG={c['antigravity_sessions']}, Codex={c['codex_sessions']}, "
             f"WB={c.get('workbuddy_sessions', 0)}{t3o_part}, Git={c['git_repos']}, Files={c['file_groups']}, "
-            f"Span={p['overall_active_span'] or '-'}, EstHours={p['overall_estimated_hours']}"
+            f"Span={p['overall_active_span'] or '-'}, EstHours={p['overall_estimated_hours']}{push_part}"
         )
 
 

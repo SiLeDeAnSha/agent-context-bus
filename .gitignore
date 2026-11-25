@@ -8,3 +8,6 @@ __pycache__/
 .DS_Store
 *.xlsx
 *.log
+server/.env
+deploy/frpc.toml
+remote.json

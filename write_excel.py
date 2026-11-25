@@ -17,7 +17,7 @@ from openpyxl.utils import get_column_letter
 import query_memory
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
+CONFIG_PATH = os.environ.get("DAILY_MEMORY_CONFIG_PATH") or os.path.join(BASE_DIR, "config.json")
 EXAMPLE_CONFIG_PATH = os.path.join(BASE_DIR, "config.example.json")
 
 SHEET_OVERVIEW = "每日概览"
@@ -112,11 +112,7 @@ HOUR_COLS = {
 def load_config() -> dict[str, Any]:
     path = CONFIG_PATH if os.path.exists(CONFIG_PATH) else EXAMPLE_CONFIG_PATH
     with open(path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-    for k in ("excel_path", "personal_excel_path", "export_dir", "memory_index_path"):
-        if isinstance(cfg.get(k), str):
-            cfg[k] = os.path.expanduser(cfg[k])
-    return cfg
+        return json.load(f)
 
 
 def span_sort_key(span: str) -> tuple[int, str]:
@@ -923,6 +919,7 @@ def main() -> None:
     parser.add_argument("--input", nargs="+", required=True, help="One or more summary JSON files.")
     parser.add_argument("--work-output", help="Override Work Excel output path.")
     parser.add_argument("--personal-output", help="Override Personal Excel output path.")
+    parser.add_argument("--data-dir", default=os.environ.get("DAILY_MEMORY_DATA_DIR"), help="Override JSON data directory.")
     parser.add_argument("--no-monthly", action="store_true", help="Disable per-month YYYY-MM subfolder workbooks.")
     parser.add_argument("--no-index-sync", action="store_true", help="Skip syncing monthly/master JSON indexes.")
     parser.add_argument("--no-memory-index", action="store_true", help="Skip regenerating MEMORY_INDEX.md.")
@@ -943,11 +940,12 @@ def main() -> None:
     if res.get("months"):
         print(f"Updated monthly workbooks: {', '.join(sorted(res['months'].keys()))}")
     if not args.work_output and not args.personal_output and not args.no_index_sync:
-        idx_res = sync_json_indexes(all_days)
+        target_data_dir = args.data_dir or os.path.join(BASE_DIR, "data")
+        idx_res = sync_json_indexes(all_days, data_dir=target_data_dir)
         print(f"Synced JSON indexes: {idx_res}")
         if not args.no_memory_index:
             mem_res = query_memory.generate_memory_index(
-                query_memory.load_all_days(),
+                query_memory.load_all_days(target_data_dir),
                 output_path=query_memory.resolve_index_path(cfg),
                 tz_name=str(cfg.get("timezone") or "Asia/Shanghai"),
             )

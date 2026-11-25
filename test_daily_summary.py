@@ -60,7 +60,7 @@ class DailySummaryTests(unittest.TestCase):
                         "category": "设计与排版",
                         "tool": "Antigravity",
                         "session_name": "Poster Chat",
-                        "summary": "在 /Users/demo/project 优化海报",
+                        "summary": "在 ~/demo 优化海报",
                         "outputs": "海报.psd",
                         "status": "已完成",
                         "next_step": "-",
@@ -136,7 +136,7 @@ class DailySummaryTests(unittest.TestCase):
             self.assertIn("小雪节气海报", md)
             self.assertNotIn("ComfyUI", md)
             self.assertNotIn("VPN", md)
-            self.assertNotIn("/Users/demo", md)
+            self.assertNotIn("/Users/youruser", md)
 
     def test_monthly_folder_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -324,7 +324,7 @@ class DailySummaryTests(unittest.TestCase):
                 );
                 """
             )
-            conn.execute("INSERT INTO projection_projects VALUES ('p1', 't3code', '/Users/demo/Desktop/t3code')")
+            conn.execute("INSERT INTO projection_projects VALUES ('p1', 't3code', '~/Desktop/t3code')")
             conn.executemany(
                 "INSERT INTO orchestration_v2_projection_threads VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 [
@@ -457,14 +457,14 @@ class DailySummaryTests(unittest.TestCase):
                                 "source": "Antigravity",
                                 "id": "uuid-mem-123",
                                 "display_title": "检索CLI开发",
-                                "workspace": "/tmp/demo",
+                                "workspace": "~/demo",
                                 "user_prompts": ["实现 query_memory.py 并支持 raw 下钻"],
                                 "assistant_milestones": ["完成索引与检索逻辑"],
                             }
                         ],
                         "git": [
                             {
-                                "repo": "/tmp/demo",
+                                "repo": "~/demo",
                                 "repo_name": "demo",
                                 "commits": [
                                     {
@@ -510,14 +510,14 @@ class DailySummaryTests(unittest.TestCase):
     def test_sync_global_rules_idempotency_and_preservation(self) -> None:
         import importlib.util
 
-        repo_root = os.path.dirname(os.path.abspath(__file__))
-        script_path = os.path.join(repo_root, "skills", "daily-memory", "scripts", "sync_global_rules.py")
+        script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills", "daily-memory", "scripts", "sync_global_rules.py")
         spec = importlib.util.spec_from_file_location("sync_global_rules", script_path)
         assert spec and spec.loader
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
 
         with tempfile.TemporaryDirectory() as tmpdir:
+            # 1. Empty file -> appended, second run -> unchanged
             empty_fp = os.path.join(tmpdir, "AGENTS.md")
             open(empty_fp, "w", encoding="utf-8").close()
             self.assertEqual(mod.check_rule_file(empty_fp), "missing_block")
@@ -527,6 +527,7 @@ class DailySummaryTests(unittest.TestCase):
             r2 = mod.sync_rule_file(empty_fp)
             self.assertEqual(r2["action"], "unchanged")
 
+            # 2. Existing non-empty content + outdated block -> preserves surrounding content
             mixed_fp = os.path.join(tmpdir, "GEMINI.md")
             with open(mixed_fp, "w", encoding="utf-8") as f:
                 f.write("<!-- FLUE START -->\nkeep me\n<!-- FLUE END -->\n\n")
@@ -542,6 +543,7 @@ class DailySummaryTests(unittest.TestCase):
             self.assertNotIn("old stale block", final_text)
             self.assertEqual(mod.sync_rule_file(mixed_fp)["action"], "unchanged")
 
+            # 3. Skill symlink idempotency
             skills_dir = os.path.join(tmpdir, "skills")
             src_dir = os.path.join(tmpdir, "src_skill")
             os.makedirs(skills_dir)
@@ -550,6 +552,321 @@ class DailySummaryTests(unittest.TestCase):
             self.assertEqual(s1["action"], "linked")
             s2 = mod.sync_skill_symlink(skills_dir, source_dir=src_dir, skill_name="daily-memory")
             self.assertEqual(s2["action"], "unchanged")
+
+
+class NasHubAndMultiMachineTests(unittest.TestCase):
+    def _sample_raw(self, workday: str, machine: str, session_id: str, title: str, workspace: str, span: str) -> dict:
+        return {
+            "workday": workday,
+            "weekday": "周三",
+            "machine": machine,
+            "window_local": f"{workday} 05:00 ~ next 05:00 (Asia/Shanghai)",
+            "overall_active_span": span,
+            "overall_estimated_hours": 1.25,
+            "antigravity_hours": 1.25,
+            "codex_hours": 0.0,
+            "workbuddy_hours": 0.0,
+            "t3_other_hours": 0.0,
+            "existing_projects": [],
+            "counts": {
+                "antigravity_sessions": 1,
+                "codex_sessions": 0,
+                "workbuddy_sessions": 0,
+                "t3_other_sessions": 0,
+                "git_repos": 1,
+                "file_groups": 0,
+            },
+            "antigravity": [
+                {
+                    "id": session_id,
+                    "source": "Antigravity",
+                    "title": title,
+                    "workspace": workspace,
+                    "active_span": span,
+                    "estimated_hours": 1.25,
+                    "user_prompts": [f"继续推进 {title}"],
+                    "assistant_milestones": [f"在 {machine} 完成 {title} 验证"],
+                }
+            ],
+            "codex": [],
+            "workbuddy": [],
+            "t3_other": [],
+            "git": [
+                {
+                    "repo": workspace,
+                    "repo_name": os.path.basename(workspace.replace("\\", "/")),
+                    "commits": [{"hash": "abc1234", "time": "10:30", "subject": f"{machine} feat", "files": ["main.py"]}],
+                }
+            ],
+            "files": [],
+        }
+
+    def test_multi_machine_sharded_raw_merge_without_conflict(self) -> None:
+        import multi_machine
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = os.path.join(tmpdir, "data")
+            mac_raw = self._sample_raw("2026-11-25", "macbook", "ag-mac-1", "gpu-broker 服务端", "/Users/dev/gpu-broker", "09:10-10:40")
+            win_raw = self._sample_raw("2026-11-25", "win-pc", "ag-win-1", "gpu-broker Windows Agent", "D:\\projects\\gpu-broker", "14:00-15:30")
+
+            r1 = multi_machine.save_machine_raw(data_dir, "macbook", mac_raw)
+            self.assertEqual(r1["machines"], ["macbook"])
+
+            r2 = multi_machine.save_machine_raw(data_dir, "win-pc", win_raw)
+            self.assertEqual(r2["machines"], ["macbook", "win-pc"])
+            self.assertEqual(r2["counts"]["antigravity_sessions"], 2)
+            self.assertEqual(r2["counts"]["git_repos"], 2)
+
+            merged = query_memory.load_raw_day("2026-11-25", data_dir=data_dir)
+            assert merged is not None
+            self.assertEqual(merged["overall_active_span"], "09:10-15:30")
+            self.assertEqual(merged["overall_estimated_hours"], 2.5)
+            self.assertEqual({s["machine"] for s in merged["antigravity"]}, {"macbook", "win-pc"})
+
+            # Re-uploading win-pc updates win-pc shard without wiping macbook
+            r3 = multi_machine.save_machine_raw(data_dir, "win-pc", win_raw)
+            self.assertEqual(r3["counts"]["antigravity_sessions"], 2)
+
+    def test_nas_server_auth_mcp_failover_and_offline_cache(self) -> None:
+        import subprocess
+        import sys
+        import threading
+        from urllib import request as urlrequest
+        import remote_client
+        from server import app as hub_app
+
+        os.environ["DAILY_MEMORY_QUIET_LOG"] = "1"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            storage_root = os.path.join(tmpdir, "nas_storage")
+            cache_dir = os.path.join(tmpdir, "client_cache")
+            state = hub_app.HubState(
+                storage_root=storage_root,
+                read_token="read-secret-token",
+                write_token="write-secret-token",
+                allow_fallback_summarize=True,
+            )
+            srv = hub_app.create_server("127.0.0.1", 0, state)
+            port = srv.server_address[1]
+            t = threading.Thread(target=srv.serve_forever, daemon=True)
+            t.start()
+            base_url = f"http://127.0.0.1:{port}"
+
+            try:
+                # 1. Healthz works without token; /api/v1/status rejects missing token
+                with urlrequest.urlopen(f"{base_url}/healthz", timeout=3) as resp:
+                    self.assertEqual(resp.status, 200)
+
+                bad_rc = remote_client.RemoteConfig(
+                    endpoints=[remote_client.Endpoint("local", base_url, 3.0)],
+                    read_token="wrong",
+                    write_token="wrong",
+                    machine_id="macbook",
+                    cache_dir=cache_dir,
+                )
+                with self.assertRaises(remote_client.RemoteAuthError):
+                    remote_client.request_json(bad_rc, "GET", "/api/v1/status")
+
+                # 2. Multi-endpoint failover: dead LAN endpoint -> working fallback endpoint
+                ro_rc = remote_client.RemoteConfig(
+                    endpoints=[
+                        remote_client.Endpoint("dead-lan", "http://127.0.0.1:1", 0.5),
+                        remote_client.Endpoint("ipv4-https", base_url, 3.0),
+                    ],
+                    read_token="read-secret-token",
+                    write_token="read-secret-token",  # read-only token must fail write endpoints
+                    machine_id="company-laptop",
+                    cache_dir=cache_dir,
+                )
+                rw_rc = remote_client.RemoteConfig(
+                    endpoints=[
+                        remote_client.Endpoint("dead-lan", "http://127.0.0.1:1", 0.5),
+                        remote_client.Endpoint("ipv4-https", base_url, 3.0),
+                    ],
+                    read_token="read-secret-token",
+                    write_token="write-secret-token",
+                    machine_id="macbook",
+                    cache_dir=cache_dir,
+                )
+
+                mac_raw = self._sample_raw("2026-11-25", "macbook", "ag-mac-1", "gpu-broker Mac联调", "/Users/dev/gpu-broker", "09:00-10:00")
+                win_raw = self._sample_raw("2026-11-25", "win-pc", "ag-win-1", "gpu-broker Win联调", "D:\\code\\gpu-broker", "14:00-15:00")
+
+                # Read-only token must be blocked on ingest/raw
+                with self.assertRaises(remote_client.RemoteAuthError):
+                    remote_client.push_raw(ro_rc, mac_raw, machine_id="macbook")
+
+                # Write token succeeds via failover endpoint
+                res1, ep1 = remote_client.push_raw(rw_rc, mac_raw, machine_id="macbook")
+                self.assertTrue(res1["ok"])
+                self.assertEqual(ep1.name, "ipv4-https")
+                res2, _ = remote_client.push_raw(rw_rc, win_raw, machine_id="win-pc")
+                self.assertEqual(res2["machines"], ["macbook", "win-pc"])
+
+                # 3. Trigger NAS-side fusion summarize (fallback rule mode) -> builds Excel + JSON + MEMORY_INDEX.md
+                sum_res, _ = remote_client.request_json(
+                    rw_rc,
+                    "POST",
+                    "/api/v1/summarize",
+                    json_body={"workday": "2026-11-25", "allow_fallback": True},
+                    write=True,
+                )
+                self.assertEqual(sum_res["status"], "ok")
+                self.assertEqual(sum_res["workdays"], ["2026-11-25"])
+                self.assertTrue(os.path.exists(state.memory_index_path))
+                self.assertTrue(os.path.exists(state.personal_excel_path))
+
+                # 4. Read-only client queries via REST & syncs local offline cache
+                idx_md, _ = remote_client.request_text(ro_rc, "GET", "/api/v1/index")
+                self.assertIn("gpu-broker", idx_md)
+                win_only_md, _ = remote_client.request_text(
+                    ro_rc, "GET", "/api/v1/query", params={"project": "gpu-broker", "machine": "win-pc", "raw": "1"}
+                )
+                self.assertIn("ag-win-1", win_only_md)
+                self.assertNotIn("ag-mac-1", win_only_md)
+
+                sync_info = remote_client.sync_local_cache(ro_rc)
+                self.assertEqual(sync_info["total_days"], 1)
+                self.assertTrue(os.path.exists(sync_info["index_path"]))
+
+                # 5. Remote MCP (Streamable HTTP JSON-RPC 2.0) with read-only token
+                init_resp, _ = remote_client.request_json(
+                    ro_rc,
+                    "POST",
+                    "/mcp",
+                    json_body={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26"}},
+                    write=False,
+                )
+                self.assertEqual(init_resp["result"]["serverInfo"]["name"], "daily-memory-hub")
+
+                tools_resp, _ = remote_client.request_json(
+                    ro_rc,
+                    "POST",
+                    "/mcp",
+                    json_body={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+                    write=False,
+                )
+                tool_names = [tool["name"] for tool in tools_resp["result"]["tools"]]
+                self.assertIn("memory_get_index", tool_names)
+                self.assertIn("memory_query", tool_names)
+
+                call_resp, _ = remote_client.request_json(
+                    ro_rc,
+                    "POST",
+                    "/mcp",
+                    json_body={
+                        "jsonrpc": "2.0",
+                        "id": 3,
+                        "method": "tools/call",
+                        "params": {"name": "memory_query", "arguments": {"project": "gpu-broker", "machine": "macbook", "raw": True}},
+                    },
+                    write=False,
+                )
+                call_text = call_resp["result"]["content"][0]["text"]
+                self.assertIn("ag-mac-1", call_text)
+                self.assertNotIn("ag-win-1", call_text)
+            finally:
+                srv.shutdown()
+                srv.server_close()
+
+            # 6. Offline fallback: server is now down; query_memory.py must transparently fall back to local cache
+            remote_cfg_path = os.path.join(tmpdir, "remote.json")
+            with open(remote_cfg_path, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "endpoints": [{"name": "down-nas", "url": base_url, "timeout": 0.5}],
+                        "read_token": "read-secret-token",
+                        "cache_dir": cache_dir,
+                    },
+                    fh,
+                )
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "query_memory.py"),
+                    "--remote",
+                    "--remote-config",
+                    remote_cfg_path,
+                    "--project",
+                    "gpu-broker",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+            self.assertIn("gpu-broker", proc.stdout)
+            self.assertIn("offline cache", proc.stderr)
+
+    def test_summarizer_openai_compatible_mock(self) -> None:
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        import threading
+        import multi_machine
+        import summarizer
+
+        mock_reply = {
+            "workday": "2026-11-25",
+            "weekday": "周三",
+            "headline": "双端联调 gpu-broker 并部署飞牛 NAS 记忆中心",
+            "core_outputs": "完成双端联调与合并测试",
+            "work_items": [
+                {
+                    "project": "gpu-broker 多机联调",
+                    "category": "工具开发",
+                    "tool": "Antigravity",
+                    "machine": "win-pc",
+                    "session_name": "gpu-broker Win联调",
+                    "summary": "在 Windows 台式机完成推理节点验证。",
+                    "outputs": "D:\\code\\gpu-broker",
+                    "active_span": "14:00-15:00",
+                    "estimated_hours": 1.0,
+                    "status": "进行中",
+                    "next_step": "接入飞牛定时汇总",
+                    "scope": "personal",
+                }
+            ],
+            "life_items": [],
+            "project_briefs": {"gpu-broker 多机联调": {"ag": "完成 Windows 节点联调", "codex": "-", "wb": "-"}},
+        }
+
+        class MockLLMHandler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length") or "0")
+                _ = self.rfile.read(length)
+                body = json.dumps(
+                    {"choices": [{"message": {"content": json.dumps(mock_reply, ensure_ascii=False)}}]},
+                    ensure_ascii=False,
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        llm_srv = HTTPServer(("127.0.0.1", 0), MockLLMHandler)
+        llm_port = llm_srv.server_address[1]
+        threading.Thread(target=llm_srv.serve_forever, daemon=True).start()
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                data_dir = os.path.join(tmpdir, "data")
+                raw = self._sample_raw("2026-11-25", "win-pc", "ag-win-1", "gpu-broker Win联调", "D:\\code\\gpu-broker", "14:00-15:00")
+                multi_machine.save_machine_raw(data_dir, "win-pc", raw)
+                result = summarizer.summarize_workday(
+                    "2026-11-25",
+                    data_dir,
+                    llm_base_url=f"http://127.0.0.1:{llm_port}/v1",
+                    llm_api_key="test-key",
+                    llm_model="mock-model",
+                )
+                self.assertEqual(result["workday"], "2026-11-25")
+                self.assertEqual(result["machines"], ["win-pc"])
+                self.assertEqual(result["personal_estimated_hours"], 1.0)
+                self.assertEqual(result["work_items"][0]["machine"], "win-pc")
+        finally:
+            llm_srv.shutdown()
+            llm_srv.server_close()
 
 
 if __name__ == "__main__":

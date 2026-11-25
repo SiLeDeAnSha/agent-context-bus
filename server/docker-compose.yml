@@ -1,0 +1,61 @@
+services:
+  daily-memory-hub:
+    build:
+      context: ..
+      dockerfile: server/Dockerfile
+    container_name: daily-memory-hub
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${DAILY_MEMORY_BIND_HOST:-0.0.0.0}:${DAILY_MEMORY_PORT:-8765}:8765"
+      - "${DAILY_MEMORY_TLS_PORT:-8766}:8766"
+    environment:
+      TZ: "${TZ:-Asia/Shanghai}"
+      DAILY_MEMORY_HOST: "::"
+      DAILY_MEMORY_STORAGE_ROOT: "/srv/daily-memory"
+      DAILY_MEMORY_TLS_PORT: "${DAILY_MEMORY_TLS_PORT:-0}"
+      DAILY_MEMORY_TLS_DIR: "/srv/tls"
+      DAILY_MEMORY_READ_TOKEN: "${DAILY_MEMORY_READ_TOKEN:?Set DAILY_MEMORY_READ_TOKEN in .env}"
+      DAILY_MEMORY_WRITE_TOKEN: "${DAILY_MEMORY_WRITE_TOKEN:?Set DAILY_MEMORY_WRITE_TOKEN in .env}"
+      DAY_START_HOUR: "${DAY_START_HOUR:-5}"
+      MONTHLY_FOLDERS: "${MONTHLY_FOLDERS:-true}"
+      RATE_LIMIT_PER_MIN: "${RATE_LIMIT_PER_MIN:-180}"
+      ENABLE_AUTO_SUMMARIZE: "${ENABLE_AUTO_SUMMARIZE:-true}"
+      SUMMARIZE_CRON_HOUR: "${SUMMARIZE_CRON_HOUR:-9}"
+      SUMMARIZE_CRON_MINUTE: "${SUMMARIZE_CRON_MINUTE:-5}"
+      LLM_BASE_URL: "${LLM_BASE_URL:-}"
+      LLM_API_KEY: "${LLM_API_KEY:-}"
+      LLM_MODEL: "${LLM_MODEL:-gpt-4o-mini}"
+      ALLOW_FALLBACK_SUMMARIZE: "${ALLOW_FALLBACK_SUMMARIZE:-false}"
+    volumes:
+      - "${DAILY_MEMORY_DATA_ROOT:-/vol1/1000/DailyMemory}:/srv/daily-memory"
+      - "${DAILY_MEMORY_TLS_HOST_DIR:-/dev/null}:/srv/tls:ro"
+    mem_limit: 256m
+
+  # Optional IPv4+IPv6 HTTPS public tunnel (no public IPv4 or router port-forward needed)
+  # Enable with: docker compose --profile cloudflared up -d
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: daily-memory-cloudflared
+    profiles: ["cloudflared"]
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    depends_on:
+      daily-memory-hub:
+        condition: service_healthy
+    mem_limit: 128m
+
+  # Optional FRP client for self-hosted VPS IPv4 public access
+  # Enable with: docker compose --profile frpc up -d
+  frpc:
+    image: snowdreamtech/frpc:latest
+    container_name: daily-memory-frpc
+    profiles: ["frpc"]
+    restart: unless-stopped
+    volumes:
+      - "../deploy/frpc.toml:/etc/frp/frpc.toml:ro"
+    depends_on:
+      daily-memory-hub:
+        condition: service_healthy
+    mem_limit: 64m

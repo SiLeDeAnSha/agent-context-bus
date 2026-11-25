@@ -1,0 +1,15 @@
+# Copy to deploy/frpc.toml if using self-hosted VPS IPv4 public access via FRP.
+# Enable with: docker compose --profile frpc up -d
+
+serverAddr = "YOUR_VPS_IPV4_OR_DOMAIN"
+serverPort = 7000
+auth.method = "token"
+auth.token = "YOUR_FRP_AUTH_TOKEN"
+
+[[proxies]]
+name = "daily-memory-hub"
+type = "tcp"
+localIP = "daily-memory-hub"
+localPort = 8765
+remotePort = 18765
+# On the VPS, reverse-proxy https://mem.yourdomain.com -> http://127.0.0.1:18765 with TLS (Caddy/Nginx).

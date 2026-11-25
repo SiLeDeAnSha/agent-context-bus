@@ -1,0 +1,11 @@
+{
+  "_comment": "30-second read-only Remote MCP setup for any new/company computer (only needs READ_TOKEN).",
+  "mcpServers": {
+    "daily-memory": {
+      "url": "https://mem.yourdomain.com/mcp",
+      "headers": {
+        "Authorization": "Bearer PASTE_DAILY_MEMORY_READ_TOKEN"
+      }
+    }
+  }
+}
