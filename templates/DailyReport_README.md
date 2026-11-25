@@ -18,9 +18,16 @@
    - 按维度/时间窗口过滤：
      `python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --projects --scope personal --days 14`
      `python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --date YYYY-MM-DD --raw`
+   - 审核/合并/拆分重名项目别名（v0.2.0，配置 NAS 时自动走 NAS 登记表）：
+     `python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --project-review`
+     `python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --merge-projects "<主项目名>" "<别名>"`
+     `python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --split-project "<别名>"`
+   - 检索本机原会话原文片段（v0.2.0，当摘要和 `--raw` 省略具体命令/报错原文时按出处会话 ID 下钻）：
+     `python3 ~/.gemini/antigravity/scratch/daily-summary/search_sessions.py --keyword "<原文关键词>" --session-id "<会话 ID>"`
 3. **直接读结构化底层数据（需自定义统计或二次分析时）**：
    - 全量汇总：`~/.gemini/antigravity/scratch/daily-summary/data/summary_all_history.json`
    - 按月汇总：`~/.gemini/antigravity/scratch/daily-summary/data/months/summary_<YYYY-MM>.json`
+   - 项目身份登记表：`~/.gemini/antigravity/scratch/daily-summary/data/project_registry.json`
    - 原始采集（含会话列表、Git 提交、本地改动文件）：`~/.gemini/antigravity/scratch/daily-summary/data/raw/<YYYY-MM>/raw_<YYYY-MM-DD>.json`
 
 ## 2. 目录边界与禁区
@@ -38,7 +45,7 @@
 `summary_all_history.json` 顶层为 `{"days": [...]}`，每天记录包含：
 - `workday` / `weekday` / `active_span`：工作日期（以凌晨 `05:00` 切日）、星期、活跃时段
 - `headline` / `core_outputs`：当日核心主线与主要产出
-- `work_items`：项目级明细（`scope`: `work` / `personal`、`project`、`category`、`tool`、`session_name`、`summary`、`outputs`、`status`、`next_step`、`active_span`、`estimated_hours`）
+- `work_items`：项目级明细（`scope`: `work` / `personal`、`project`、`project_id`、`category`、`tool`、`session_name`、`summary`、`outputs`、`sources`（出处校验引用）、`status`、`next_step`、`active_span`、`estimated_hours`）
 - `life_items`：零碎问答、生活探索与随想（`tool`、`session_name`、`topic`、`summary`、`active_span`）
 - `project_briefs`：按项目聚合的各工具（`ag` / `codex` / `wb`）当日精炼进展
 

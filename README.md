@@ -1,4 +1,4 @@
-# 每日工作汇总 (Daily Summary)
+# 日迹 · 每日工作汇总 (Daily Summary)
 
 自动采集本地 **Antigravity / Codex / WorkBuddy / T3 Code** 多端工作轨迹（其中 T3 Code 通过 `statev2.sqlite` 按实际 Provider 自动归口并与 Codex 去重），支持定时任务触发，并**严格分离为两份独立 Excel 总表**：
 

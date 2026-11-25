@@ -36,12 +36,13 @@ description: 检索与维护跨端 AI 历史工作与技术记忆库（Antigravi
    # 查看指定日期全天记录
    python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --date YYYY-MM-DD
    ```
-3. **采集证据与原会话定位**：
-   用 `--raw` 查看会话 ID、工作区、抽样消息与 Git 或文件证据。需要找日报和采集证据里省略的命令、报错原文或对话时，再搜索本机原会话。
+3. **进展出处与原会话定位（v0.2.0）**：
+   - 项目、关键词与日期查询结果会直接显示已校验的出处引用（`session` / `commit` / `file`；缺少可核验引用显示「来源待核对」）。加 `--raw` 只展开命中进展所引用的原始记录。
+   - 需要找日报摘要和 `--raw` 省略的命令、报错原文或对话细节时，用出处里的会话 ID 搜索本机原会话：
    ```bash
    python3 ~/.gemini/antigravity/scratch/daily-summary/search_sessions.py --keyword "<命令或报错的一段原文>" --session-id "<会话 ID>"
    ```
-   会话 ID 未知时可用 `--client antigravity|codex|workbuddy|t3` 及 `--date YYYY-MM-DD` 缩小范围。默认最多返回 5 个命中片段及其出处。只读命中片段即可，普通日报检索仍走前两步。
+   会话 ID 未知时可用 `--client antigravity|codex|workbuddy|t3`、`--date YYYY-MM-DD`、`--from`/`--to` 缩小范围，或加 `--json` 输出结构化结果。默认返回最近 5 个命中片段及其出处；只读命中片段即可，普通日报检索仍走前两步。
 
 ---
 
@@ -118,3 +119,26 @@ python3 ~/.gemini/antigravity/scratch/daily-summary/collect.py --yesterday --mis
 ```
 
 - 部署脚本与配置模板位于 `~/.gemini/antigravity/scratch/daily-summary/deploy/`（含 `nas_deploy.sh`、`NAS_DEPLOYMENT.md`、`mcp_client_examples.json`）。
+
+---
+
+## 工作流 F：项目身份、别名合并/拆分与首次导入向导（v0.2.0）
+
+旧日报与新日报统一按稳定 `project_id` 聚合，查询接受主名称、别名或 ID。仅当用户明确要求整理重名项目、审核 AI 合并建议或重跑首次导入时执行写操作：
+
+```bash
+# 1. 查看 AI 建议合并的重名/候选项目（只读）
+python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --project-review
+
+# 2. 合并项目别名（保留第一个项目的 ID；写操作，配置 NAS 时自动走 NAS 并需写权限）
+python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --merge-projects "<主项目名>" "<别名1>" "<别名2>"
+
+# 3. 拆分误合并别名，或将候选名称确认为独立项目
+python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --split-project "<别名>"
+python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --split-project "<新项目主名称>" "<已合并别名A>" "<已合并别名B>"
+
+# 如需仅操作本机登记表，加 --local 或 --data-dir；更新后按需 --rebuild-index / --sync-cache
+
+# 4. 首次导入终端向导（检查本机 4 端可读历史并导入近 7 天到 data/first-import/，不影响正式日报）
+python3 ~/.gemini/antigravity/scratch/daily-summary/onboarding.py
+```

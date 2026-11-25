@@ -26,9 +26,10 @@ CANONICAL_BLOCK = f"""{START_MARKER}
 When the user asks to locate past work, projects, files, or previous Antigravity/Codex/WorkBuddy/T3 Code sessions (e.g., "找一下我前几天弄的…", "接着之前的…继续", "刷新今天/补跑某天汇总", or "导出对外日报/周报"), use the local memory index first (avoid parsing `.xlsx` unless editing/verifying Excel output):
 
 - **AI memory entry & current-state snapshot (read first)**: `~/Documents/DailyReport/MEMORY_INDEX.md` (auto-refreshed by `write_excel.py`) and `~/Documents/DailyReport/README.md`
-- **Fast on-demand query & raw drill-down CLI (zero-dep `python3`)**: `python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py` (`--project`, `--keyword`, `--days`, `--scope work|personal|life`, `--date`, `--raw`, `--rebuild-index`)
+- **Fast on-demand query, provenance & project-identity CLI (zero-dep `python3`)**: `python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py` (`--project`, `--keyword`, `--days`, `--scope work|personal|life`, `--date`, `--raw`, `--project-review`, `--merge-projects`, `--split-project`, `--rebuild-index`)
+- **Raw local session snippet search (v0.2.0)**: `python3 ~/.gemini/antigravity/scratch/daily-summary/search_sessions.py` (`--keyword`, `--session-id`, `--client antigravity|codex|workbuddy|t3`, `--date`, `--from`, `--to`, `--json`)
 - Official work & personal Excel views (human-facing): `~/Documents/DailyReport/每日工作汇总.xlsx`, `~/Documents/DailyReport/个人技术与折腾汇总.xlsx`, monthly archives `~/Documents/DailyReport/<YYYY-MM>/`, and sanitized external reports `~/Documents/DailyReport/对外报告/` (never use external reports as full source of truth)
-- Underlying JSON indexes & pipeline scripts: `~/.gemini/antigravity/scratch/daily-summary/` (`data/summary_all_history.json`, `data/months/summary_<YYYY-MM>.json`, `data/raw/<YYYY-MM>/raw_*.json`, and `.venv/bin/python` with `collect.py`, `write_excel.py`, `export_report.py`)
+- Underlying JSON indexes & pipeline scripts: `~/.gemini/antigravity/scratch/daily-summary/` (`data/summary_all_history.json`, `data/months/summary_<YYYY-MM>.json`, `data/raw/<YYYY-MM>/raw_*.json`, `data/project_registry.json`, `onboarding.py`, and `.venv/bin/python` with `collect.py`, `write_excel.py`, `export_report.py`)
 {END_MARKER}"""
 
 DEFAULT_RULE_TARGETS: dict[str, str] = {
