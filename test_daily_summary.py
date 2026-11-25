@@ -13,6 +13,7 @@ from openpyxl import load_workbook
 
 import collect
 import export_report
+import query_memory
 import write_excel
 
 
@@ -369,6 +370,186 @@ class DailySummaryTests(unittest.TestCase):
             self.assertEqual(other[0]["source"], "Claude")
             self.assertEqual(len(cx), 0)
             self.assertEqual(hints.get("cx-uuid-1"), "Codex已采集 [T3·t3code]")
+
+    def test_memory_index_generation_and_queries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = os.path.join(tmpdir, "data")
+            raw_dir = os.path.join(data_dir, "raw", "2026-11")
+            os.makedirs(raw_dir, exist_ok=True)
+            days = [
+                {
+                    "workday": "2026-11-20",
+                    "weekday": "周五",
+                    "active_span": "10:00-12:00",
+                    "headline": "旧方案尝试",
+                    "core_outputs": "初版脚本",
+                    "work_items": [
+                        {
+                            "scope": "personal",
+                            "project": "记忆库改造",
+                            "category": "自动化",
+                            "tool": "Antigravity",
+                            "session_name": "方案设计",
+                            "summary": "使用旧方案 A",
+                            "outputs": "old.py",
+                            "status": "进行中",
+                            "next_step": "待重构",
+                            "active_span": "10:00-11:00",
+                            "estimated_hours": 1.0,
+                        },
+                        {
+                            "scope": "work",
+                            "project": "政务海报",
+                            "category": "设计",
+                            "tool": "Codex",
+                            "session_name": "海报定稿",
+                            "summary": "输出最终海报",
+                            "outputs": "poster.psd",
+                            "status": "已完成",
+                            "next_step": "-",
+                            "active_span": "11:00-12:00",
+                            "estimated_hours": 1.0,
+                        },
+                    ],
+                    "life_items": [],
+                },
+                {
+                    "workday": "2026-11-24",
+                    "weekday": "周二",
+                    "active_span": "14:00-16:00",
+                    "headline": "记忆库落地",
+                    "core_outputs": "query_memory.py",
+                    "project_briefs": {"记忆库改造": {"ag": "切换到最新方案 B 并上线检索 CLI"}},
+                    "work_items": [
+                        {
+                            "scope": "personal",
+                            "project": "记忆库改造",
+                            "category": "自动化",
+                            "tool": "Antigravity",
+                            "session_name": "检索CLI开发",
+                            "summary": "落地新方案 B",
+                            "outputs": "query_memory.py",
+                            "status": "待验证",
+                            "next_step": "跑完单测",
+                            "active_span": "14:00-16:00",
+                            "estimated_hours": 2.0,
+                        }
+                    ],
+                    "life_items": [
+                        {
+                            "tool": "Antigravity",
+                            "session_name": "模型对比",
+                            "topic": "Gemini 4 档位",
+                            "summary": "讨论 Neon 与 Hydrogen 区别",
+                            "active_span": "15:00",
+                        }
+                    ],
+                },
+            ]
+            with open(os.path.join(data_dir, "summary_all_history.json"), "w", encoding="utf-8") as f:
+                json.dump({"days": days}, f, ensure_ascii=False)
+            with open(os.path.join(raw_dir, "raw_2026-11-24.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "workday": "2026-11-24",
+                        "antigravity": [
+                            {
+                                "source": "Antigravity",
+                                "id": "uuid-mem-123",
+                                "display_title": "检索CLI开发",
+                                "workspace": "/tmp/demo",
+                                "user_prompts": ["实现 query_memory.py 并支持 raw 下钻"],
+                                "assistant_milestones": ["完成索引与检索逻辑"],
+                            }
+                        ],
+                        "git": [
+                            {
+                                "repo": "/tmp/demo",
+                                "repo_name": "demo",
+                                "commits": [
+                                    {
+                                        "hash": "abc1234",
+                                        "time": "15:30",
+                                        "subject": "feat: add query_memory",
+                                        "files": ["query_memory.py"],
+                                    }
+                                ],
+                            }
+                        ],
+                        "files": [],
+                    },
+                    f,
+                    ensure_ascii=False,
+                )
+
+            idx_path = os.path.join(tmpdir, "MEMORY_INDEX.md")
+            stats = query_memory.generate_memory_index(days, output_path=idx_path)
+            self.assertEqual(stats["days"], 2)
+            self.assertEqual(stats["work_projects"], 1)
+            self.assertEqual(stats["personal_projects"], 1)
+            with open(idx_path, "r", encoding="utf-8") as f:
+                md = f.read()
+            self.assertIn("活跃与待跟进项目（置顶）", md)
+            self.assertIn("切换到最新方案 B 并上线检索 CLI", md)
+            self.assertIn("政务海报", md)
+            self.assertIn("跑完单测", md)
+
+            tl = query_memory.query_project_timeline(days, "记忆库", include_raw=True, data_dir=data_dir)
+            self.assertEqual(tl["total_matches"], 2)
+            self.assertEqual(tl["entries"][0]["workday"], "2026-11-24")
+            self.assertEqual(tl["raw"][0]["sessions"][0]["id"], "uuid-mem-123")
+
+            kw = query_memory.query_keyword(days, "query_memory", include_raw=True, data_dir=data_dir)
+            self.assertEqual(kw["total_matches"], 1)
+            self.assertEqual(kw["raw"][0]["git"][0]["commits"][0]["hash"], "abc1234")
+
+            life_kw = query_memory.query_keyword(days, "Hydrogen", scope="life", data_dir=data_dir)
+            self.assertEqual(life_kw["total_matches"], 1)
+            self.assertEqual(life_kw["hits"][0]["kind"], "life_item")
+
+    def test_sync_global_rules_idempotency_and_preservation(self) -> None:
+        import importlib.util
+
+        repo_root = os.path.dirname(os.path.abspath(__file__))
+        script_path = os.path.join(repo_root, "skills", "daily-memory", "scripts", "sync_global_rules.py")
+        spec = importlib.util.spec_from_file_location("sync_global_rules", script_path)
+        assert spec and spec.loader
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            empty_fp = os.path.join(tmpdir, "AGENTS.md")
+            open(empty_fp, "w", encoding="utf-8").close()
+            self.assertEqual(mod.check_rule_file(empty_fp), "missing_block")
+            r1 = mod.sync_rule_file(empty_fp)
+            self.assertEqual(r1["action"], "appended")
+            self.assertEqual(mod.check_rule_file(empty_fp), "synced")
+            r2 = mod.sync_rule_file(empty_fp)
+            self.assertEqual(r2["action"], "unchanged")
+
+            mixed_fp = os.path.join(tmpdir, "GEMINI.md")
+            with open(mixed_fp, "w", encoding="utf-8") as f:
+                f.write("<!-- FLUE START -->\nkeep me\n<!-- FLUE END -->\n\n")
+                f.write(f"{mod.START_MARKER}\nold stale block\n{mod.END_MARKER}\n\n# Footer\n")
+            self.assertEqual(mod.check_rule_file(mixed_fp), "outdated")
+            r3 = mod.sync_rule_file(mixed_fp)
+            self.assertEqual(r3["action"], "updated")
+            with open(mixed_fp, "r", encoding="utf-8") as f:
+                final_text = f.read()
+            self.assertIn("keep me", final_text)
+            self.assertIn("# Footer", final_text)
+            self.assertIn("MEMORY_INDEX.md", final_text)
+            self.assertNotIn("old stale block", final_text)
+            self.assertEqual(mod.sync_rule_file(mixed_fp)["action"], "unchanged")
+
+            skills_dir = os.path.join(tmpdir, "skills")
+            src_dir = os.path.join(tmpdir, "src_skill")
+            os.makedirs(skills_dir)
+            os.makedirs(src_dir)
+            s1 = mod.sync_skill_symlink(skills_dir, source_dir=src_dir, skill_name="daily-memory")
+            self.assertEqual(s1["action"], "linked")
+            s2 = mod.sync_skill_symlink(skills_dir, source_dir=src_dir, skill_name="daily-memory")
+            self.assertEqual(s2["action"], "unchanged")
 
 
 if __name__ == "__main__":

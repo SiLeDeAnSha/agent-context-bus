@@ -14,6 +14,8 @@ from openpyxl.comments import Comment
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
+import query_memory
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 EXAMPLE_CONFIG_PATH = os.path.join(BASE_DIR, "config.example.json")
@@ -111,7 +113,7 @@ def load_config() -> dict[str, Any]:
     path = CONFIG_PATH if os.path.exists(CONFIG_PATH) else EXAMPLE_CONFIG_PATH
     with open(path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
-    for k in ("excel_path", "personal_excel_path", "export_dir"):
+    for k in ("excel_path", "personal_excel_path", "export_dir", "memory_index_path"):
         if isinstance(cfg.get(k), str):
             cfg[k] = os.path.expanduser(cfg[k])
     return cfg
@@ -923,6 +925,7 @@ def main() -> None:
     parser.add_argument("--personal-output", help="Override Personal Excel output path.")
     parser.add_argument("--no-monthly", action="store_true", help="Disable per-month YYYY-MM subfolder workbooks.")
     parser.add_argument("--no-index-sync", action="store_true", help="Skip syncing monthly/master JSON indexes.")
+    parser.add_argument("--no-memory-index", action="store_true", help="Skip regenerating MEMORY_INDEX.md.")
     args = parser.parse_args()
 
     all_days: list[dict[str, Any]] = []
@@ -942,6 +945,13 @@ def main() -> None:
     if not args.work_output and not args.personal_output and not args.no_index_sync:
         idx_res = sync_json_indexes(all_days)
         print(f"Synced JSON indexes: {idx_res}")
+        if not args.no_memory_index:
+            mem_res = query_memory.generate_memory_index(
+                query_memory.load_all_days(),
+                output_path=query_memory.resolve_index_path(cfg),
+                tz_name=str(cfg.get("timezone") or "Asia/Shanghai"),
+            )
+            print(f"Updated memory index: {mem_res}")
 
 
 if __name__ == "__main__":

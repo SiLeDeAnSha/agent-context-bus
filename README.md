@@ -26,7 +26,10 @@
 
 - 配置模板：`config.example.json`（复制为 `config.json` 按需修改；未创建 `config.json` 时自动回退读取模板）
 - 采集脚本：`collect.py`（支持 `--yesterday --missing` 自动补齐漏跑日期）
-- 写表脚本：`write_excel.py`（自动按 `scope: "work" | "personal"` 写入两份独立总表）
+- 写表脚本：`write_excel.py`（自动按 `scope: "work" | "personal"` 写入两份独立总表，并在同步 JSON 索引后自动原子刷新 `MEMORY_INDEX.md`）
+- AI 记忆索引与检索 CLI：`query_memory.py`（零外部依赖，支持生成 `~/Documents/DailyReport/MEMORY_INDEX.md` 现状快照，以及按项目/关键词/日期/`--raw` 原始会话与 Git 溯源检索）
+- 跨端 AI Skill 与规则装配：`skills/daily-memory/`（内置 `SKILL.md` 与 `scripts/sync_global_rules.py`，可一键幂等同步 Antigravity / Codex / Claude Code / WorkBuddy 四端全局记忆规则与 Skill 软链）
+- 输出目录入口模板：`templates/DailyReport_README.md`（复制到 `~/Documents/DailyReport/README.md` 作为跨端 AI 读取契约）
 - 对外周报/日报导出：`export_report.py`（基于正式工作表导出脱敏 Markdown 周报/日报）
 - 云端同步预处理：`prepare_gsheets.py`
 - 单元测试：`test_daily_summary.py`
@@ -37,6 +40,13 @@
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 cp config.example.json config.json
+cp templates/DailyReport_README.md ~/Documents/DailyReport/README.md
+
+# 重建全项目现行状态快照（零依赖，系统 python3 即可）
+python3 query_memory.py --rebuild-index
+
+# 一键幂等同步多端全局记忆规则与 daily-memory Skill 软链
+python3 skills/daily-memory/scripts/sync_global_rules.py --sync-skills
 
 # 运行单元测试（需 Python 3.14+ 内置 compression.zstd 与 openpyxl）
 .venv/bin/python -m unittest -v test_daily_summary.py

@@ -3,6 +3,7 @@
   "personal_excel_path": "~/Documents/DailyReport/个人技术与折腾汇总.xlsx",
   "monthly_folders": true,
   "export_dir": "~/Documents/DailyReport/对外报告",
+  "memory_index_path": "~/Documents/DailyReport/MEMORY_INDEX.md",
   "timezone": "Asia/Shanghai",
   "day_start_hour": 5,
   "merge_gap_minutes": 30,
