@@ -24,7 +24,7 @@ from provenance import SESSION_BUCKETS, verify_day_sources
 from project_identity import name_key
 
 
-SYSTEM_PROMPT = """你是一个跨设备、跨端（Antigravity / Codex / WorkBuddy / Git / 本地文件）工作与个人技术记忆汇总助手。
+SYSTEM_PROMPT = """你是一个跨设备、跨端（Antigravity / Codex / Claude Code / WorkBuddy / Git / 本地文件）工作与个人技术记忆汇总助手。
 输入是某一天（workday）从多台设备合并后的原始轨迹 raw JSON，以及历史已有项目名列表。
 请严格输出**纯 JSON 对象**（不要 markdown 代码块、不要多余说明），格式必须完全符合以下 schema：
 {
@@ -118,10 +118,12 @@ def _compact_raw_for_llm(raw_payload: dict[str, Any], existing_projects: list[di
         "overall_estimated_hours": raw_payload.get("overall_estimated_hours", 0.0),
         "antigravity_hours": raw_payload.get("antigravity_hours", 0.0),
         "codex_hours": raw_payload.get("codex_hours", 0.0),
+        "claude_hours": raw_payload.get("claude_hours", 0.0),
         "workbuddy_hours": raw_payload.get("workbuddy_hours", 0.0),
         "existing_projects": existing_projects[:60],
         "antigravity": trim_sessions(raw_payload.get("antigravity") or []),
         "codex": trim_sessions(raw_payload.get("codex") or []),
+        "claude": trim_sessions(raw_payload.get("claude") or []),
         "workbuddy": trim_sessions(raw_payload.get("workbuddy") or []),
         "git": (raw_payload.get("git") or [])[:30],
         "files": (raw_payload.get("files") or [])[:30],
@@ -311,10 +313,11 @@ def fallback_rule_summarize(
 ) -> dict[str, Any]:
     """Deterministic fallback summarizer when no LLM API key is configured (useful for tests/offline)."""
     work_items: list[dict[str, Any]] = []
-    project_briefs: dict[str, dict[str, str]] = defaultdict(lambda: {"ag": "-", "codex": "-", "wb": "-"})
+    project_briefs: dict[str, dict[str, str]] = defaultdict(lambda: {"ag": "-", "codex": "-", "wb": "-", "claude": "-"})
     tool_map = (
         ("antigravity", "Antigravity", "ag"),
         ("codex", "Codex", "codex"),
+        ("claude", "Claude Code", "claude"),
         ("workbuddy", "WorkBuddy", "wb"),
     )
     if import_labels is None:

@@ -22,7 +22,7 @@ from collect import (
 from query_memory import load_config
 
 
-CLIENTS = ("antigravity", "codex", "workbuddy")
+CLIENTS = ("antigravity", "codex", "claude", "workbuddy")
 MAX_EXCERPT = 800
 EARLIEST = datetime.min.replace(tzinfo=timezone.utc)
 
@@ -94,6 +94,30 @@ def codex_texts(event):
         yield "error", payload.get("message")
 
 
+def claude_texts(event):
+    if event.get("isSidechain"):
+        return
+    kind = event.get("type")
+    if kind not in ("user", "assistant"):
+        return
+    msg = event.get("message")
+    content = msg.get("content") if isinstance(msg, dict) else event.get("content")
+    if isinstance(content, str):
+        yield kind, content
+    elif isinstance(content, list):
+        for block in content:
+            if isinstance(block, str):
+                yield kind, block
+            elif isinstance(block, dict):
+                btype = block.get("type")
+                if btype == "text":
+                    yield kind, block.get("text")
+                elif btype == "tool_use":
+                    yield "tool_call", tool_arguments(block.get("input"))
+                elif btype == "tool_result":
+                    yield "tool_output", block.get("content")
+
+
 def session_files(client, ids):
     if client == "antigravity":
         brain = Path.home() / ".gemini/antigravity/brain"
@@ -115,6 +139,11 @@ def session_files(client, ids):
             if (not ids or sid in ids) and sid not in seen:
                 seen.add(sid)
                 yield sid, path
+    elif client == "claude":
+        root = Path.home() / ".claude/projects"
+        for path in sorted(root.glob("*/*.jsonl")):
+            if path.is_file() and (not ids or path.stem in ids):
+                yield path.stem, path
     elif client == "workbuddy":
         root = Path.home() / ".workbuddy/projects"
         for path in sorted(root.rglob("*.jsonl")):
@@ -135,6 +164,9 @@ def jsonl_records(client, ids, errors):
                     elif client == "codex":
                         dt = parse_iso_dt(event.get("timestamp") or "")
                         fields = codex_texts(event)
+                    elif client == "claude":
+                        dt = parse_iso_dt(event.get("timestamp") or "")
+                        fields = claude_texts(event)
                     else:
                         dt = parse_workbuddy_ts(event.get("timestamp"))
                         fields = message_or_tool(event)

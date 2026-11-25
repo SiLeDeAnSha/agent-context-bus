@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Zero-LLM real-time WAL layer for Agent Context Bus (跨端 AI 记忆中枢).
 
-Captures same-day activity across Antigravity, Codex, WorkBuddy, and local
+Captures same-day activity across Antigravity, Codex, Claude Code, WorkBuddy, and local
 Git repositories with zero extra LLM tokens, plus manual/agent `--note` entries.
 Once a workday is compacted into `summary_all_history.json`, its live block
 automatically exits `MEMORY_INDEX.md`.
@@ -578,6 +578,104 @@ def scan_workbuddy_today(
     return out
 
 
+def _read_claude_session_meta(fp: str) -> dict[str, str]:
+    title = ""
+    cwd = ""
+    last_prompt = ""
+    try:
+        with open(fp, "r", encoding="utf-8", errors="ignore") as fh:
+            lines = fh.readlines()
+        for line in lines:
+            if '"custom-title"' in line or '"ai-title"' in line or '"workingDirectory"' in line or '"cwd"' in line or '"last-prompt"' in line:
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(obj, dict) or obj.get("isSidechain"):
+                    continue
+                t = obj.get("type")
+                if t == "custom-title" and obj.get("customTitle"):
+                    title = _clean_text(obj["customTitle"], 80)
+                elif t == "ai-title" and obj.get("aiTitle") and not title:
+                    title = _clean_text(obj["aiTitle"], 80)
+                elif t == "last-prompt" and obj.get("lastPrompt"):
+                    last_prompt = _clean_text(obj["lastPrompt"], 140)
+                elif t == "attachment" and not cwd:
+                    snap = (obj.get("attachment") or {}).get("snapshot") if isinstance(obj.get("attachment"), dict) else None
+                    if isinstance(snap, dict) and snap.get("workingDirectory"):
+                        cwd = _shorten_home(str(snap["workingDirectory"]))
+                if obj.get("cwd") and not cwd:
+                    cwd = _shorten_home(str(obj["cwd"]))
+        if not last_prompt:
+            for line in reversed(lines[-80:]):
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(obj, dict) or obj.get("isSidechain") or obj.get("type") != "user":
+                    continue
+                msg = obj.get("message")
+                content = msg.get("content") if isinstance(msg, dict) else obj.get("content")
+                txt = ""
+                if isinstance(content, str):
+                    txt = content
+                elif isinstance(content, list):
+                    txt = " ".join(
+                        str(b.get("text") or "")
+                        for b in content
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    )
+                txt = re.sub(r"<system-reminder[^>]*>.*?</system-reminder>", "", txt, flags=re.S).strip()
+                if txt:
+                    last_prompt = _clean_text(txt, 140)
+                    break
+    except OSError:
+        pass
+    return {"title": title, "cwd": cwd, "last_prompt": last_prompt}
+
+
+def scan_claude_today(
+    start: datetime,
+    end: datetime,
+    tz: ZoneInfo,
+    *,
+    projects_dir: str | None = None,
+) -> list[dict[str, Any]]:
+    root = projects_dir or os.path.expanduser("~/.claude/projects")
+    if not os.path.isdir(root):
+        return []
+    start_ts = start.timestamp()
+    out: list[dict[str, Any]] = []
+    for fp in glob.glob(os.path.join(root, "*", "*.jsonl")):
+        try:
+            st = os.stat(fp)
+        except OSError:
+            continue
+        if st.st_mtime < start_ts:
+            continue
+        local_dt = datetime.fromtimestamp(st.st_mtime, tz=tz)
+        if not (start <= local_dt < end):
+            continue
+        sid = os.path.splitext(os.path.basename(fp))[0]
+        meta = _read_claude_session_meta(fp)
+        ws = meta["cwd"]
+        summary = meta["last_prompt"]
+        title = meta["title"] or _clean_text(summary[:50], 80) or _clean_text(os.path.basename(ws.rstrip("/")), 80) or sid[:8]
+        out.append(
+            {
+                "key": f"claude:{sid}",
+                "tool": "Claude Code",
+                "id": sid,
+                "title": title,
+                "summary": summary,
+                "workspace": ws,
+                "updated_at": local_dt.isoformat(timespec="seconds"),
+                "time": local_dt.strftime("%H:%M"),
+            }
+        )
+    return out
+
+
 def scan_git_today(
     start: datetime,
     end: datetime,
@@ -746,13 +844,19 @@ def _extract_hook_session(
         sid = str(payload.get("session_id") or payload.get("sessionId") or "").strip()
         if not sid:
             return None
-        ws = _shorten_home(str(payload.get("cwd") or ""))
-        summary = _clean_text(payload.get("last_assistant_message") or payload.get("prompt") or "", 140)
+        tpath = str(payload.get("transcript_path") or "").strip()
+        meta = _read_claude_session_meta(tpath) if tpath and os.path.isfile(tpath) else {"title": "", "cwd": "", "last_prompt": ""}
+        ws = _shorten_home(str(payload.get("cwd") or "")) or meta["cwd"]
+        summary = _clean_text(
+            payload.get("last_assistant_message") or payload.get("prompt") or meta["last_prompt"] or "",
+            140,
+        )
+        title = meta["title"] or _clean_text(os.path.basename(ws.rstrip("/")) or summary[:50] or sid[:8], 80)
         return {
             "key": f"claude:{sid}",
             "tool": "Claude Code",
             "id": sid,
-            "title": _clean_text(os.path.basename(ws.rstrip("/")) or sid[:8], 80),
+            "title": title,
             "summary": summary,
             "workspace": ws,
             "updated_at": now.isoformat(timespec="seconds"),
@@ -775,6 +879,7 @@ def sync_live(
     index_output: str | None = None,
     ag_db_path: str | None = None,
     codex_home: str | None = None,
+    claude_dir: str | None = None,
     workbuddy_dir: str | None = None,
 ) -> dict[str, Any]:
     cfg = cfg if cfg is not None else _load_cfg()
@@ -823,6 +928,8 @@ def sync_live(
             for s in scan_antigravity_today(start, end, tz, db_path=ag_db_path):
                 sessions = _merge_session(sessions, s)
             for s in scan_codex_today(start, end, tz, codex_home=codex_home):
+                sessions = _merge_session(sessions, s)
+            for s in scan_claude_today(start, end, tz, projects_dir=claude_dir):
                 sessions = _merge_session(sessions, s)
             for s in scan_workbuddy_today(start, end, tz, projects_dir=workbuddy_dir):
                 sessions = _merge_session(sessions, s)

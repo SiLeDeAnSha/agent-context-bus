@@ -448,12 +448,14 @@ class DailySummaryTests(unittest.TestCase):
             r2 = sgr.sync_client_hooks("antigravity", path=ag_hooks_path)
             self.assertEqual(r1["action"], "added")
             self.assertEqual(r2["action"], "unchanged")
-            saved_ag = json.load(open(ag_hooks_path, encoding="utf-8"))
+            with open(ag_hooks_path, encoding="utf-8") as fh:
+                saved_ag = json.load(fh)
             self.assertIn("user-custom", saved_ag)
             self.assertTrue(saved_ag[sgr.HOOK_NAME]["enabled"])
             r3 = sgr.sync_client_hooks("antigravity", path=ag_hooks_path, disable=True)
             self.assertEqual(r3["action"], "disabled")
-            self.assertFalse(json.load(open(ag_hooks_path, encoding="utf-8"))[sgr.HOOK_NAME]["enabled"])
+            with open(ag_hooks_path, encoding="utf-8") as fh:
+                self.assertFalse(json.load(fh)[sgr.HOOK_NAME]["enabled"])
 
             cx_hooks_path = os.path.join(tmpdir, "cx_hooks.json")
             with open(cx_hooks_path, "w", encoding="utf-8") as fh:
@@ -462,11 +464,29 @@ class DailySummaryTests(unittest.TestCase):
             c2 = sgr.sync_client_hooks("codex", path=cx_hooks_path)
             self.assertEqual(c1["action"], "added")
             self.assertEqual(c2["action"], "unchanged")
-            saved_cx = json.load(open(cx_hooks_path, encoding="utf-8"))
+            with open(cx_hooks_path, encoding="utf-8") as fh:
+                saved_cx = json.load(fh)
             self.assertEqual(len(saved_cx["hooks"]["Stop"]), 2)
             c3 = sgr.sync_client_hooks("codex", path=cx_hooks_path, disable=True)
             self.assertEqual(c3["action"], "disabled")
-            self.assertEqual(len(json.load(open(cx_hooks_path, encoding="utf-8"))["hooks"]["Stop"]), 1)
+            with open(cx_hooks_path, encoding="utf-8") as fh:
+                self.assertEqual(len(json.load(fh)["hooks"]["Stop"]), 1)
+
+            cl_settings_path = os.path.join(tmpdir, "claude_settings.json")
+            with open(cl_settings_path, "w", encoding="utf-8") as fh:
+                json.dump({"theme": "auto", "env": {}}, fh)
+            k1 = sgr.sync_client_hooks("claude", path=cl_settings_path)
+            k2 = sgr.sync_client_hooks("claude", path=cl_settings_path)
+            self.assertEqual(k1["action"], "added")
+            self.assertEqual(k2["action"], "unchanged")
+            with open(cl_settings_path, encoding="utf-8") as fh:
+                saved_cl = json.load(fh)
+            self.assertEqual(saved_cl["theme"], "auto")
+            self.assertEqual(len(saved_cl["hooks"]["Stop"]), 1)
+            k3 = sgr.sync_client_hooks("claude", path=cl_settings_path, disable=True)
+            self.assertEqual(k3["action"], "disabled")
+            with open(cl_settings_path, encoding="utf-8") as fh:
+                self.assertEqual(len(json.load(fh)["hooks"]["Stop"]), 0)
 
     def test_workday_boundary_5am(self) -> None:
         tz = ZoneInfo("Asia/Shanghai")
@@ -1358,6 +1378,102 @@ class NasHubAndMultiMachineTests(unittest.TestCase):
         finally:
             llm_srv.shutdown()
             llm_srv.server_close()
+
+    def test_claude_code_collection_live_and_search(self) -> None:
+        from datetime import timezone
+        from unittest import mock
+        import live_memory
+        import re
+        import search_sessions
+
+        tz = ZoneInfo("Asia/Shanghai")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            proj_dir = Path(tmpdir) / ".claude" / "projects" / "-Users-dev-payments-api"
+            proj_dir.mkdir(parents=True)
+            sid = "cc-9988-7766"
+            jpath = proj_dir / f"{sid}.jsonl"
+            now = datetime.now(tz)
+            workday = live_memory.resolve_workday({"timezone": "Asia/Shanghai", "day_start_hour": 5}, now=now)
+            ts_utc = now.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+            lines = [
+                {"type": "ai-title", "aiTitle": "Payments Webhook Retry Fix", "sessionId": sid},
+                {
+                    "type": "attachment",
+                    "attachment": {
+                        "type": "environment",
+                        "snapshot": {"workingDirectory": "/Users/dev/payments-api"},
+                    },
+                    "timestamp": ts_utc,
+                },
+                {
+                    "type": "user",
+                    "isSidechain": False,
+                    "timestamp": ts_utc,
+                    "message": {
+                        "role": "user",
+                        "content": "<system-reminder>ignore</system-reminder> Fix ECONNRESET retry lock in webhook worker",
+                    },
+                },
+                {
+                    "type": "assistant",
+                    "isSidechain": False,
+                    "timestamp": ts_utc,
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "thinking", "thinking": "hidden thought"},
+                            {"type": "text", "text": "Updated retry_worker.py with idempotency lock and unit tests."},
+                            {"type": "tool_use", "name": "Bash", "input": {"command": "pytest tests/test_retry.py"}},
+                        ],
+                    },
+                },
+                {
+                    "type": "user",
+                    "isSidechain": True,
+                    "timestamp": ts_utc,
+                    "message": {"role": "user", "content": "sidechain noise should be ignored"},
+                },
+            ]
+            jpath.write_text("\n".join(json.dumps(x, ensure_ascii=False) for x in lines) + "\n", encoding="utf-8")
+
+            # 1. collect_claude
+            start_dt, end_dt = collect.workday_bounds(workday, "Asia/Shanghai", 5)
+            cfg = {"self_filter_markers": [], "merge_gap_minutes": 30, "day_start_hour": 5}
+            items, ts = collect.collect_claude(start_dt, end_dt, tz, workday, cfg, projects_root=str(Path(tmpdir) / ".claude" / "projects"))
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0]["source"], "Claude Code")
+            self.assertEqual(items[0]["title"], "Payments Webhook Retry Fix")
+            self.assertEqual(items[0]["cwd"], "/Users/dev/payments-api")
+            self.assertIn("Fix ECONNRESET retry lock", items[0]["user_prompts"][0])
+            self.assertGreaterEqual(len(ts), 2)
+
+            # 2. live_memory.scan_claude_today & hook extraction
+            live_items = live_memory.scan_claude_today(start_dt, end_dt, tz, projects_dir=str(Path(tmpdir) / ".claude" / "projects"))
+            self.assertEqual(len(live_items), 1)
+            self.assertEqual(live_items[0]["tool"], "Claude Code")
+            self.assertEqual(live_items[0]["title"], "Payments Webhook Retry Fix")
+
+            hook_rec = live_memory._extract_hook_session(
+                "claude",
+                {"session_id": sid, "transcript_path": str(jpath), "cwd": "/Users/dev/payments-api"},
+                now,
+            )
+            self.assertIsNotNone(hook_rec)
+            self.assertEqual(hook_rec["title"], "Payments Webhook Retry Fix")
+
+            # 3. search_sessions.find_matches for claude
+            with mock.patch.object(search_sessions.Path, "home", return_value=Path(tmpdir)):
+                errors: list[str] = []
+                pattern = re.compile(re.escape("ECONNRESET"), re.IGNORECASE)
+                matches = list(search_sessions.find_matches(("claude",), set(), pattern, None, None, tz, 5, errors))
+                self.assertEqual(errors, [])
+                self.assertEqual(len(matches), 1)
+                self.assertEqual(matches[0][1]["client"], "claude")
+                self.assertEqual(matches[0][1]["session_id"], sid)
+                sidechain_matches = list(
+                    search_sessions.find_matches(("claude",), set(), re.compile("sidechain noise"), None, None, tz, 5, errors)
+                )
+                self.assertEqual(sidechain_matches, [])
 
 
 if __name__ == "__main__":

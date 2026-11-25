@@ -3,7 +3,7 @@
 from collections import defaultdict
 from typing import Any
 
-SESSION_BUCKETS = ("antigravity", "codex", "workbuddy")
+SESSION_BUCKETS = ("antigravity", "codex", "claude", "workbuddy")
 SOURCE_PENDING = "来源待核对"
 SOURCE_RECORDED = "已记录"
 SOURCE_ARCHIVE_MISSING = "原始档案暂不可用"

@@ -42,7 +42,7 @@ description: 跨端 AI 记忆中枢（Agent Context Bus）检索与维护 skill�
    ```bash
    python3 ~/.gemini/antigravity/scratch/daily-summary/search_sessions.py --keyword "<命令或报错的一段原文>" --session-id "<会话 ID>"
    ```
-   会话 ID 未知时可用 `--client antigravity|codex|workbuddy`、`--date YYYY-MM-DD`、`--from`/`--to` 缩小范围，或加 `--json` 输出结构化结果。默认返回最近 5 个命中片段及其出处；只读命中片段即可，普通日报检索仍走前两步。
+   会话 ID 未知时可用 `--client antigravity|codex|claude|workbuddy`、`--date YYYY-MM-DD`、`--from`/`--to` 缩小范围，或加 `--json` 输出结构化结果。默认返回最近 5 个命中片段及其出处；只读命中片段即可，普通日报检索仍走前两步。
 
 ---
 
@@ -87,7 +87,7 @@ python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --rebuild-in
 # 1. 先只读检查四端（Antigravity / Codex / Claude / WorkBuddy）规则与 Skill 软链状态
 python3 ~/.cc-switch/skills/daily-memory/scripts/sync_global_rules.py --check
 
-# 2. 幂等同步四端全局规则、补齐 Skill 软链并装配 Antigravity/Codex Stop 钩子（0 注入，仅异步写入实时层）
+# 2. 幂等同步四端全局规则、补齐 Skill 软链并装配 Antigravity/Codex/Claude Code Stop 钩子（0 注入，仅异步写入实时层）
 python3 ~/.cc-switch/skills/daily-memory/scripts/sync_global_rules.py --sync-skills --sync-hooks
 
 # 如需关闭 Stop 钩子，一键回退：
