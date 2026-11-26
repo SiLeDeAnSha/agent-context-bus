@@ -69,6 +69,7 @@ def handle_hook(
                     client,
                     "--payload-file",
                     tmp_path,
+                    "--push-remote",
                 ],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,

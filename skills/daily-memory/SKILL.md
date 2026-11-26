@@ -145,12 +145,20 @@ python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --add-path "
 python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --remove-path "<项目名>" "<路径>"
 python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --set-paths "<项目名>" "<路径1>" "<路径2>"
 
-# 5. 当日 0 Token 实时动态记一笔 / 强制刷新实时层（跨端交接立即生效）
+# 5. 当日 0 Token 实时动态记一笔 / 强制刷新实时层（跨端交接立即生效，自动脱敏高危凭据）
 python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --note "<项目名>" "<刚完成的关键结论或改动>"
 python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --live-sync
 
+# 6. 长期决策 / 硬约束 / 避坑记录与显式淘汰（supersede 链）、FTS5 重建与一键体检
+python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --decision "<项目名>" "<长期决策或避坑约束>" --kind constraint
+python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --global-decision "<跨项目全局避坑约束>" --kind pitfall
+python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --decisions
+python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --supersede "<旧决策ID>" "<新替代方案>"
+python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --reindex
+python3 ~/.gemini/antigravity/scratch/daily-summary/query_memory.py --doctor --fix
+
 # 如需仅操作本机登记表，加 --local 或 --data-dir；更新后按需 --rebuild-index / --sync-cache
 
-# 5. 首次导入终端向导（检查本机 4 端可读历史并导入近 7 天到 data/first-import/，不影响正式日报）
+# 7. 首次导入终端向导（检查本机 4 端可读历史并导入近 7 天到 data/first-import/，不影响正式日报）
 python3 ~/.gemini/antigravity/scratch/daily-summary/onboarding.py
 ```

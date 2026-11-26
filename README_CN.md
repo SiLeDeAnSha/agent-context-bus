@@ -107,11 +107,24 @@ python3 skills/daily-memory/scripts/sync_global_rules.py --disable-hooks
 ### 日常高频命令速查
 
 ```bash
-# 随时记一笔关键结论（可选附带路径），秒级刷新 MEMORY_INDEX.md
+# 随时记一笔关键结论（可选附带路径），秒级刷新 MEMORY_INDEX.md（自动脱敏高危凭据）
 python3 query_memory.py --note "代理分流规则优化" "新增 Meta AI 走犹他独享住宅 IP 分流" \
   --note-path ~/projects/proxy-rules ~/.config/clash/script.js
 
-# 强制触发一次 0-Token 实时增量扫描（四端会话 + 今日 Git）
+# 记录长期决策 / 硬约束 / 避坑结论，或显式淘汰旧方案（supersede 链）
+python3 query_memory.py --decision "代理分流规则优化" "仅高优先级域名走住宅 IP，避免污染全局 TUN" --kind constraint --tags clash,tun
+python3 query_memory.py --global-decision "macOS 互联网共享无法转发 utun 流量，车机抓包需切代理模式" --kind pitfall
+python3 query_memory.py --decisions
+python3 query_memory.py --supersede <旧决策ID> "<新替代方案>"
+
+# 中文模糊 + BM25 相关性检索（SQLite FTS5，加 --exact 退回严格子串匹配；--reindex 强制重建索引）
+python3 query_memory.py --keyword "算力 告警" --limit 15
+python3 query_memory.py --reindex
+
+# 一键体检（查环境 / FTS5 / 四端 Hook / JSON 完整性 / NAS 5 级线路；加 --fix 无损自愈）
+python3 query_memory.py --doctor --fix
+
+# 强制触发一次 0-Token 实时增量扫描（四端尾部上下文 + 今日 Git，配置 NAS 时自动防抖同步）
 python3 query_memory.py --live-sync
 
 # 为项目登记、移除或覆盖物理目录与核心配置文件路径
@@ -141,8 +154,8 @@ python3 search_sessions.py --keyword "ffprobe" --client claude --date 2026-11-25
   ```bash
   python3 collect.py --yesterday --push --machine win-desktop
   ```
-- 客户端自动按 **LAN → Tailscale → IPv6 HTTPS → IPv4 HTTPS → 本地离线缓存** 优先级切换，并提供 `--probe` 测速与 `--sync-cache` 同步。
-- 支持 Bearer 鉴权 HTTP API 与 Remote MCP 端点，完整部署步骤见 [`deploy/NAS_DEPLOYMENT.md`](deploy/NAS_DEPLOYMENT.md)。
+- 客户端自动按 **LAN → Tailscale → IPv6 HTTPS → IPv4 HTTPS → 本地离线缓存** 优先级切换，并提供 `--probe` 测速、`--sync-cache` 同步与多机当日实时 WAL 推送（`POST /api/v1/live/push`）。
+- 支持 Bearer 鉴权 HTTP API、**8 个读写 Remote MCP 工具**（写工具强制校验 `write_token`）与零构建瑞士极简风 **Web 看板（`/ui`）**，完整部署步骤见 [`deploy/NAS_DEPLOYMENT.md`](deploy/NAS_DEPLOYMENT.md)。
 
 </details>
 

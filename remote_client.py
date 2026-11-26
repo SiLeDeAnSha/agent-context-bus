@@ -300,8 +300,70 @@ def push_summary(
     return data, ep
 
 
+def push_live(
+    rc: RemoteConfig,
+    live_payload: dict[str, Any],
+    machine_id: str | None = None,
+) -> tuple[dict[str, Any], Endpoint]:
+    mid = multi_machine.normalize_machine_id(machine_id or rc.machine_id)
+    data, ep = request_json(
+        rc,
+        "POST",
+        "/api/v1/live/push",
+        json_body={"machine_id": mid, "payload": live_payload},
+        write=True,
+    )
+    return data, ep
+
+
+def add_remote_note(
+    rc: RemoteConfig,
+    project: str,
+    text: str,
+    *,
+    paths: list[str] | None = None,
+    workday: str | None = None,
+    machine_id: str | None = None,
+) -> tuple[dict[str, Any], Endpoint]:
+    mid = multi_machine.normalize_machine_id(machine_id or rc.machine_id)
+    body: dict[str, Any] = {"project": project, "text": text, "machine_id": mid}
+    if paths:
+        body["paths"] = paths
+    if workday:
+        body["workday"] = workday
+    return request_json(rc, "POST", "/api/v1/notes", json_body=body, write=True)
+
+
+def list_remote_decisions(
+    rc: RemoteConfig,
+    *,
+    project: str | None = None,
+    scope: str | None = None,
+    kind: str | None = None,
+    include_inactive: bool = False,
+    keyword: str | None = None,
+    limit: int = 50,
+) -> tuple[dict[str, Any], Endpoint]:
+    params: dict[str, Any] = {"limit": limit}
+    if project:
+        params["project"] = project
+    if scope:
+        params["scope"] = scope
+    if kind:
+        params["kind"] = kind
+    if include_inactive:
+        params["all_status"] = "1"
+    if keyword:
+        params["keyword"] = keyword
+    return request_json(rc, "GET", "/api/v1/decisions", params=params, write=False)
+
+
+def mutate_remote_decision(rc: RemoteConfig, payload: dict[str, Any]) -> tuple[dict[str, Any], Endpoint]:
+    return request_json(rc, "POST", "/api/v1/decisions", json_body=payload, write=True)
+
+
 def sync_local_cache(rc: RemoteConfig) -> dict[str, Any]:
-    """Download the memory index, history, and project decisions into the offline cache."""
+    """Download the memory index, history, project registry, decisions, and live days into the offline cache."""
     bundle, ep = request_json(rc, "GET", "/api/v1/bundle", write=False)
     os.makedirs(os.path.join(rc.cache_dir, "data"), exist_ok=True)
     index_md = str(bundle.get("memory_index_md") or "")
@@ -314,6 +376,17 @@ def sync_local_cache(rc: RemoteConfig) -> dict[str, Any]:
     multi_machine.atomic_write_json(master_path, {"days": days})
     registry_path = os.path.join(rc.cache_dir, "data", REGISTRY_FILE)
     multi_machine.atomic_write_json(registry_path, bundle.get("project_registry") or {"projects": []})
+    if isinstance(bundle.get("decisions"), dict):
+        multi_machine.atomic_write_json(
+            os.path.join(rc.cache_dir, "data", "decisions.json"),
+            bundle["decisions"],
+        )
+    for ld in bundle.get("live_days") or []:
+        if isinstance(ld, dict) and ld.get("workday"):
+            multi_machine.atomic_write_json(
+                os.path.join(rc.cache_dir, "data", "live", f"live_{ld['workday']}.json"),
+                ld,
+            )
     meta = {
         "synced_at": datetime.now(timezone.utc).isoformat(),
         "endpoint_name": ep.name,

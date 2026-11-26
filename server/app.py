@@ -25,12 +25,21 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
+import decisions as dec_mod
+import live_memory
 import multi_machine
 import query_memory
+import redact
+import search_fts
 import summarizer
-import write_excel
+try:
+    import write_excel
+except ImportError:  # Allow running hub API/MCP/UI in pure-stdlib environments without openpyxl
+    write_excel = None  # type: ignore[assignment]
 from project_identity import ProjectCatalog, edit_registry, load_registry
 from provenance import verify_day_sources
+
+UI_HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui.html")
 
 
 MCP_PROTOCOL_VERSION = "2025-03-26"
@@ -103,7 +112,55 @@ MCP_TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "memory_add_note",
+        "description": "Write a 0-token real-time same-day note (optionally registering physical paths) into the hub live WAL. Requires write_token.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string", "description": "Project name or alias"},
+                "text": {"type": "string", "description": "Key conclusion, decision, or change summary"},
+                "paths": {"type": "array", "items": {"type": "string"}, "description": "Optional project file/dir paths"},
+                "machine": {"type": "string", "description": "Optional source machine ID"},
+            },
+            "required": ["project", "text"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "memory_register_path",
+        "description": "Add, remove, or replace registered physical directories/config paths for a project. Requires write_token.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string", "description": "Project name, alias, or ID"},
+                "paths": {"type": "array", "items": {"type": "string"}, "description": "Paths to register"},
+                "mode": {"type": "string", "enum": ["add", "remove", "set"], "default": "add"},
+            },
+            "required": ["project", "paths"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "memory_add_decision",
+        "description": "Record a persistent project or global decision/constraint/pitfall, optionally superseding older decision IDs. Requires write_token.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "scope": {"type": "string", "enum": ["project", "global"], "default": "project"},
+                "project": {"type": "string", "description": "Project name (required when scope=project)"},
+                "kind": {"type": "string", "enum": ["decision", "constraint", "pitfall"], "default": "decision"},
+                "text": {"type": "string", "description": "Reusable decision, constraint, or pitfall"},
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "supersedes": {"type": "array", "items": {"type": "string"}, "description": "Old decision IDs replaced by this one"},
+            },
+            "required": ["text"],
+            "additionalProperties": False,
+        },
+    },
 ]
+
+MCP_WRITE_TOOLS = {"memory_add_note", "memory_register_path", "memory_add_decision"}
 
 
 class RateLimiter:
@@ -199,11 +256,17 @@ class HubState:
 
     def rebuild_index_locked(self) -> dict[str, Any]:
         days = query_memory.load_all_days(self.data_dir)
+        archived = {str(d.get("workday") or "") for d in days}
+        live_days = multi_machine.load_merged_live_days(self.data_dir, archived_workdays=archived, max_days=2)
+        active_decs = dec_mod.query_decisions(self.data_dir, limit=12)
         return query_memory.generate_memory_index(
             days,
             output_path=self.memory_index_path,
             tz_name=self.timezone_name,
             catalog=ProjectCatalog(days, load_registry(self.data_dir)),
+            data_dir=self.data_dir,
+            live_days=live_days,
+            active_decisions=active_decs,
         )
 
     def get_index_markdown(self) -> str:
@@ -294,14 +357,19 @@ class HubState:
 
     def get_status(self) -> dict[str, Any]:
         days = query_memory.load_all_days(self.data_dir)
+        latest = str(days[-1]["workday"]) if days else ""
+        active_decs = dec_mod.query_decisions(self.data_dir, limit=500)
         return {
             "service": "daily-memory-hub",
             "storage_root": self.storage_root,
             "total_days": len(days),
             "first_date": str(days[0]["workday"]) if days else "",
-            "latest_date": str(days[-1]["workday"]) if days else "",
+            "latest_date": latest,
+            "latest_workday": latest,
             "raw_days": len(multi_machine.list_raw_workdays(self.data_dir)),
             "machines": multi_machine.list_machines(self.data_dir),
+            "active_decisions": len(active_decs),
+            "fts_index": search_fts.index_stats(self.data_dir),
             "auto_summarize": {
                 "enabled": self.enable_auto_summarize,
                 "schedule": f"{self.summarize_hour:02d}:{self.summarize_minute:02d} ({self.timezone_name})",
@@ -435,7 +503,12 @@ def _execute_query(state: HubState, args: dict[str, Any]) -> tuple[str, Any]:
     return query_memory.format_projects_md(res), res
 
 
-def _handle_mcp_rpc(state: HubState, payload: dict[str, Any]) -> tuple[int, dict[str, Any] | None]:
+def _handle_mcp_rpc(
+    state: HubState,
+    payload: dict[str, Any],
+    *,
+    can_write: bool = False,
+) -> tuple[int, dict[str, Any] | None]:
     method = str(payload.get("method") or "")
     rpc_id = payload.get("id")
     params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
@@ -456,7 +529,7 @@ def _handle_mcp_rpc(state: HubState, payload: dict[str, Any]) -> tuple[int, dict
             {
                 "protocolVersion": req_ver,
                 "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": "daily-memory-hub", "version": "1.0.0"},
+                "serverInfo": {"name": "daily-memory-hub", "version": "1.1.0"},
             }
         )
     if method == "ping":
@@ -466,6 +539,8 @@ def _handle_mcp_rpc(state: HubState, payload: dict[str, Any]) -> tuple[int, dict
     if method == "tools/call":
         name = str(params.get("name") or "")
         args = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
+        if name in MCP_WRITE_TOOLS and not can_write:
+            return err(-32001, f"Write token required for tool: {name}")
         try:
             if name == "memory_get_index":
                 text = state.get_index_markdown()
@@ -482,6 +557,51 @@ def _handle_mcp_rpc(state: HubState, payload: dict[str, Any]) -> tuple[int, dict
                     text = json.dumps(_filter_raw_by_machine(raw, args.get("machine")), ensure_ascii=False, indent=2)
             elif name == "memory_server_status":
                 text = json.dumps(state.get_status(), ensure_ascii=False, indent=2)
+            elif name == "memory_add_note":
+                with state._write_lock:
+                    days = query_memory.load_all_days(state.data_dir)
+                    saved = live_memory.add_note(
+                        state.data_dir,
+                        days,
+                        str(args.get("project") or ""),
+                        str(args.get("text") or ""),
+                        source=f"mcp:{args.get('machine') or 'remote'}",
+                        paths=args.get("paths") if isinstance(args.get("paths"), list) else None,
+                        cfg={"timezone": state.timezone_name, "day_start_hour": state.day_start_hour},
+                    )
+                    state.rebuild_index_locked()
+                text = json.dumps({"ok": True, "workday": saved["workday"], "note": saved["note"]}, ensure_ascii=False, indent=2)
+            elif name == "memory_register_path":
+                mode_map = {"add": "add_paths", "remove": "remove_paths", "set": "set_paths"}
+                act = mode_map.get(str(args.get("mode") or "add").lower(), "add_paths")
+                with state._write_lock:
+                    days = query_memory.load_all_days(state.data_dir)
+                    proj = edit_registry(
+                        state.data_dir,
+                        days,
+                        act,
+                        str(args.get("project") or ""),
+                        list(args.get("paths") or []),
+                    )
+                    state.rebuild_index_locked()
+                text = json.dumps({"ok": True, "project": proj}, ensure_ascii=False, indent=2)
+            elif name == "memory_add_decision":
+                with state._write_lock:
+                    days = query_memory.load_all_days(state.data_dir)
+                    dec = dec_mod.add_decision(
+                        state.data_dir,
+                        days,
+                        text=str(args.get("text") or ""),
+                        scope=str(args.get("scope") or "project"),
+                        project=str(args.get("project") or ""),
+                        kind=str(args.get("kind") or "decision"),
+                        tags=args.get("tags"),
+                        supersedes=args.get("supersedes") if isinstance(args.get("supersedes"), list) else None,
+                        source="mcp",
+                        tz_name=state.timezone_name,
+                    )
+                    state.rebuild_index_locked()
+                text = json.dumps({"ok": True, "decision": dec}, ensure_ascii=False, indent=2)
             else:
                 return err(-32601, f"Unknown tool: {name}")
             return ok({"content": [{"type": "text", "text": text}], "isError": False})
@@ -559,11 +679,56 @@ def make_handler(state: HubState) -> type[BaseHTTPRequestHandler]:
                 self._send_json(200, {"status": "ok", "service": "daily-memory-hub"})
                 return
 
+            if path == "/":
+                self._send_bytes(302, b"", "text/plain; charset=utf-8", {"Location": "/ui"})
+                return
+
+            if path == "/ui":
+                if not os.path.exists(UI_HTML_PATH):
+                    self._send_json(404, {"error": "ui_not_found"})
+                    return
+                with open(UI_HTML_PATH, "rb") as fh:
+                    html = fh.read()
+                self._send_bytes(
+                    200,
+                    html,
+                    "text/html; charset=utf-8",
+                    {
+                        "X-Content-Type-Options": "nosniff",
+                        "Referrer-Policy": "no-referrer",
+                        "Content-Security-Policy": "default-src 'self' 'unsafe-inline'; connect-src 'self'",
+                    },
+                )
+                return
+
             if not self._guard(require_write=False):
                 return
 
             if path == "/api/v1/status":
                 self._send_json(200, state.get_status())
+                return
+
+            if path == "/api/v1/live":
+                days = query_memory.load_all_days(state.data_dir)
+                archived = {str(d.get("workday") or "") for d in days}
+                live_days = multi_machine.load_merged_live_days(state.data_dir, archived_workdays=archived, max_days=2)
+                self._send_json(200, {"live_days": live_days})
+                return
+
+            if path == "/api/v1/decisions":
+                days = query_memory.load_all_days(state.data_dir)
+                catalog = ProjectCatalog(days, load_registry(state.data_dir))
+                items = dec_mod.query_decisions(
+                    state.data_dir,
+                    project=qs.get("project"),
+                    scope=qs.get("scope"),
+                    kind=qs.get("kind"),
+                    include_inactive=qs.get("all_status", "").lower() in ("1", "true", "yes"),
+                    keyword=qs.get("keyword"),
+                    limit=int(qs.get("limit") or 50),
+                    catalog=catalog,
+                )
+                self._send_json(200, {"total": len(items), "decisions": items})
                 return
 
             if path == "/api/v1/index":
@@ -578,9 +743,12 @@ def make_handler(state: HubState) -> type[BaseHTTPRequestHandler]:
             if path == "/api/v1/bundle":
                 md = state.get_index_markdown()
                 days = query_memory.load_all_days(state.data_dir)
+                archived = {str(d.get("workday") or "") for d in days}
                 self._send_json(200, {
                     "memory_index_md": md, "days": days, "total_days": len(days),
                     "project_registry": load_registry(state.data_dir),
+                    "decisions": dec_mod.load_decisions_store(state.data_dir),
+                    "live_days": multi_machine.load_merged_live_days(state.data_dir, archived_workdays=archived, max_days=2),
                 })
                 return
 
@@ -660,6 +828,7 @@ def make_handler(state: HubState) -> type[BaseHTTPRequestHandler]:
             if path == "/mcp":
                 if not self._guard(require_write=False):
                     return
+                can_write = state.check_auth(self.headers.get("Authorization") or "", require_write=True)
                 try:
                     body = self._read_json_body()
                 except Exception as exc:
@@ -669,7 +838,7 @@ def make_handler(state: HubState) -> type[BaseHTTPRequestHandler]:
                     responses = []
                     for item in body:
                         if isinstance(item, dict):
-                            _, resp_obj = _handle_mcp_rpc(state, item)
+                            _, resp_obj = _handle_mcp_rpc(state, item, can_write=can_write)
                             if resp_obj is not None:
                                 responses.append(resp_obj)
                     if not responses:
@@ -680,7 +849,7 @@ def make_handler(state: HubState) -> type[BaseHTTPRequestHandler]:
                 if not isinstance(body, dict):
                     self._send_json(400, {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid Request"}})
                     return
-                status, resp_obj = _handle_mcp_rpc(state, body)
+                status, resp_obj = _handle_mcp_rpc(state, body, can_write=can_write)
                 if resp_obj is None:
                     self._send_bytes(status, b"", "application/json; charset=utf-8")
                 else:
@@ -694,6 +863,103 @@ def make_handler(state: HubState) -> type[BaseHTTPRequestHandler]:
                 body = self._read_json_body()
             except Exception as exc:
                 self._send_json(400, {"error": f"invalid_json:{exc}"})
+                return
+
+            if path == "/api/v1/live/push":
+                if not isinstance(body, dict):
+                    self._send_json(400, {"error": "body_must_be_object"})
+                    return
+                machine_id = str(body.get("machine_id") or body.get("machine") or "")
+                live_payload = body.get("payload") if isinstance(body.get("payload"), dict) else body
+                live_payload = redact.redact_obj(live_payload)
+                try:
+                    with state._write_lock:
+                        res = multi_machine.save_machine_live(state.data_dir, machine_id, live_payload)
+                        state.rebuild_index_locked()
+                        try:
+                            if os.path.exists(search_fts.index_db_path(state.data_dir)):
+                                search_fts.sync_live_to_fts(
+                                    state.data_dir,
+                                    multi_machine.load_merged_live_day(state.data_dir, res["workday"]),
+                                )
+                        except Exception:
+                            pass
+                except ValueError as exc:
+                    self._send_json(400, {"error": str(exc)})
+                    return
+                self._send_json(200, {"ok": True, **res})
+                return
+
+            if path == "/api/v1/notes":
+                if not isinstance(body, dict):
+                    self._send_json(400, {"error": "body_must_be_object"})
+                    return
+                try:
+                    with state._write_lock:
+                        days = query_memory.load_all_days(state.data_dir)
+                        saved = live_memory.add_note(
+                            state.data_dir,
+                            days,
+                            str(body.get("project") or ""),
+                            str(body.get("text") or ""),
+                            workday=body.get("workday"),
+                            source=f"api:{body.get('machine_id') or 'web'}",
+                            paths=body.get("paths") if isinstance(body.get("paths"), list) else None,
+                            cfg={"timezone": state.timezone_name, "day_start_hour": state.day_start_hour},
+                        )
+                        state.rebuild_index_locked()
+                except ValueError as exc:
+                    self._send_json(400, {"error": str(exc)})
+                    return
+                self._send_json(200, {"ok": True, "workday": saved["workday"], "note": saved["note"]})
+                return
+
+            if path == "/api/v1/decisions":
+                if not isinstance(body, dict):
+                    self._send_json(400, {"error": "body_must_be_object"})
+                    return
+                action = str(body.get("action") or "add").strip().lower()
+                try:
+                    with state._write_lock:
+                        days = query_memory.load_all_days(state.data_dir)
+                        if action == "add":
+                            dec = dec_mod.add_decision(
+                                state.data_dir,
+                                days,
+                                text=str(body.get("text") or ""),
+                                scope=str(body.get("scope") or "project"),
+                                project=str(body.get("project") or ""),
+                                kind=str(body.get("kind") or "decision"),
+                                tags=body.get("tags"),
+                                supersedes=body.get("supersedes") if isinstance(body.get("supersedes"), list) else None,
+                                source="api",
+                                tz_name=state.timezone_name,
+                            )
+                        elif action == "supersede":
+                            dec = dec_mod.supersede_decision(
+                                state.data_dir,
+                                days,
+                                str(body.get("old_id") or ""),
+                                str(body.get("text") or ""),
+                                kind=body.get("kind"),
+                                tags=body.get("tags"),
+                                source="api",
+                                tz_name=state.timezone_name,
+                            )
+                        elif action == "forget":
+                            dec = dec_mod.forget_decision(
+                                state.data_dir,
+                                str(body.get("id") or ""),
+                                reason=str(body.get("reason") or ""),
+                                tz_name=state.timezone_name,
+                            )
+                        else:
+                            raise ValueError(f"Unsupported decision action: {action!r}")
+                        state.rebuild_index_locked()
+                except ValueError as exc:
+                    self._send_json(400, {"error": str(exc)})
+                    return
+                self._send_json(200, {"ok": True, "decision": dec})
                 return
 
             if path == "/api/v1/project-review":

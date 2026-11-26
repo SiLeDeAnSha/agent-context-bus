@@ -500,6 +500,152 @@ def list_machines(data_dir: str) -> list[dict[str, Any]]:
     return out
 
 
+def _machine_live_path(data_dir: str, machine_id: str, workday: str) -> str:
+    return os.path.join(data_dir, "live", "machines", machine_id, f"live_{workday}.json")
+
+
+def merge_live_payloads(workday: str, machine_live: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Merge per-machine same-day live WALs (notes, sessions, git) preserving source machine tags."""
+    machines = sorted(machine_live.keys())
+    notes_by_key: dict[str, dict[str, Any]] = {}
+    sessions_by_key: dict[str, dict[str, Any]] = {}
+    git_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+    latest_updated = ""
+
+    for mid in machines:
+        d = machine_live[mid] or {}
+        upd = str(d.get("updated_at") or "")
+        if upd > latest_updated:
+            latest_updated = upd
+        for n in d.get("notes") or []:
+            if not isinstance(n, dict):
+                continue
+            item = dict(n)
+            if mid != "__local__" and not item.get("machine"):
+                item["machine"] = mid
+            nk = f"{item.get('project_id') or item.get('project') or ''}|{str(item.get('text') or '').strip()}"
+            prev = notes_by_key.get(nk)
+            if prev is None or str(item.get("created_at") or "") >= str(prev.get("created_at") or ""):
+                notes_by_key[nk] = item
+        for s in d.get("sessions") or []:
+            if not isinstance(s, dict):
+                continue
+            item = dict(s)
+            if mid != "__local__" and not item.get("machine"):
+                item["machine"] = mid
+            sk = f"{item.get('machine') or ''}|{item.get('key') or item.get('id') or ''}"
+            prev = sessions_by_key.get(sk)
+            if prev is None or str(item.get("updated_at") or "") >= str(prev.get("updated_at") or ""):
+                sessions_by_key[sk] = item
+        for g in d.get("git") or []:
+            if not isinstance(g, dict):
+                continue
+            item = dict(g)
+            if mid != "__local__" and not item.get("machine"):
+                item["machine"] = mid
+            gk = (str(item.get("machine") or ""), str(item.get("repo") or item.get("repo_name") or ""), str(item.get("hash") or ""))
+            git_by_key[gk] = item
+
+    notes = sorted(notes_by_key.values(), key=lambda x: str(x.get("created_at") or ""), reverse=True)[:50]
+    sessions = sorted(sessions_by_key.values(), key=lambda x: str(x.get("updated_at") or ""), reverse=True)[:32]
+    git_items = sorted(git_by_key.values(), key=lambda x: (str(x.get("committed_at") or ""), str(x.get("time") or "")), reverse=True)[:24]
+    effective_machines = sorted(m for m in machines if m != "__local__")
+    out: dict[str, Any] = {
+        "workday": workday,
+        "updated_at": latest_updated or datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "notes": notes,
+        "sessions": sessions,
+        "git": git_items,
+    }
+    if effective_machines:
+        out["machines"] = effective_machines
+    return out
+
+
+def save_machine_live(data_dir: str, machine_id: str, live_payload: dict[str, Any]) -> dict[str, Any]:
+    """Save one machine's same-day live WAL shard and rebuild merged live/<workday> view."""
+    mid = normalize_machine_id(machine_id)
+    workday = str(live_payload.get("workday") or "").strip()
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", workday):
+        raise ValueError(f"Invalid workday in live payload: {workday!r}")
+
+    stamped = {
+        "workday": workday,
+        "machine": mid,
+        "updated_at": str(live_payload.get("updated_at") or datetime.now(timezone.utc).isoformat(timespec="seconds")),
+        "notes": tag_items_with_machine(list(live_payload.get("notes") or []), mid),
+        "sessions": tag_items_with_machine(list(live_payload.get("sessions") or []), mid),
+        "git": tag_items_with_machine(list(live_payload.get("git") or []), mid),
+    }
+
+    lock_path = os.path.join(data_dir, "live", ".live.lock")
+    with file_lock(lock_path):
+        shard_path = _machine_live_path(data_dir, mid, workday)
+        atomic_write_json(shard_path, stamped)
+        merged = load_merged_live_day(data_dir, workday)
+        return {
+            "workday": workday,
+            "machine_id": mid,
+            "machines": merged.get("machines") or [mid],
+            "notes_count": len(merged.get("notes") or []),
+            "sessions_count": len(merged.get("sessions") or []),
+            "git_count": len(merged.get("git") or []),
+        }
+
+
+def load_merged_live_day(data_dir: str, workday: str) -> dict[str, Any]:
+    """Merge local live_<day>.json (if any) and all machine shards for a workday."""
+    by_machine: dict[str, dict[str, Any]] = {}
+    local_path = os.path.join(data_dir, "live", f"live_{workday}.json")
+    if os.path.exists(local_path):
+        try:
+            with open(local_path, "r", encoding="utf-8") as fh:
+                obj = json.load(fh)
+            if isinstance(obj, dict):
+                by_machine["__local__"] = obj
+        except Exception:
+            pass
+    pattern = os.path.join(data_dir, "live", "machines", "*", f"live_{workday}.json")
+    for fp in sorted(glob.glob(pattern)):
+        mid = os.path.basename(os.path.dirname(fp))
+        try:
+            with open(fp, "r", encoding="utf-8") as fh:
+                obj = json.load(fh)
+            if isinstance(obj, dict):
+                by_machine[mid] = obj
+        except Exception:
+            continue
+    if not by_machine:
+        return {"workday": workday, "updated_at": "", "notes": [], "sessions": [], "git": []}
+    return merge_live_payloads(workday, by_machine)
+
+
+def load_merged_live_days(
+    data_dir: str,
+    archived_workdays: set[str] | None = None,
+    max_days: int = 2,
+) -> list[dict[str, Any]]:
+    """Return uncompacted merged live days across local + all machine shards, newest first."""
+    archived = archived_workdays or set()
+    workdays: set[str] = set()
+    for pat in (
+        os.path.join(data_dir, "live", "live_*.json"),
+        os.path.join(data_dir, "live", "machines", "*", "live_*.json"),
+    ):
+        for fp in glob.glob(pat):
+            m = re.match(r"^live_(\d{4}-\d{2}-\d{2})\.json$", os.path.basename(fp))
+            if m and m.group(1) not in archived:
+                workdays.add(m.group(1))
+    results: list[dict[str, Any]] = []
+    for wd in sorted(workdays, reverse=True):
+        day = load_merged_live_day(data_dir, wd)
+        if day.get("notes") or day.get("sessions") or day.get("git"):
+            results.append(day)
+        if len(results) >= max_days:
+            break
+    return results
+
+
 def list_raw_workdays(data_dir: str) -> list[str]:
     """Return sorted workdays that have merged raw JSON files."""
     files = glob.glob(os.path.join(data_dir, "raw", "*", "raw_*.json"))

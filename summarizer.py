@@ -18,8 +18,10 @@ from urllib import request as urlrequest
 from urllib.parse import unquote, urlsplit
 from zoneinfo import ZoneInfo
 
+import decisions as dec_mod
 import multi_machine
 import query_memory
+import redact
 from provenance import SESSION_BUCKETS, verify_day_sources
 from project_identity import name_key
 
@@ -75,7 +77,16 @@ SYSTEM_PROMPT = """你是一个跨设备、跨端（Antigravity / Codex / Claude
       "codex": "Codex 当天一句话总结或 -",
       "wb": "WorkBuddy 当天一句话总结或 -"
     }
-  }
+  },
+  "candidate_decisions": [
+    {
+      "scope": "project 或 global",
+      "project": "项目名（global 时可留空）",
+      "kind": "decision | constraint | pitfall",
+      "text": "跨天有复用价值的关键架构决定、硬约束或踩坑避坑结论（没有则留空数组）",
+      "tags": ["可选简短标签"]
+    }
+  ]
 }
 规则：
 1. existing_projects 提供既有项目名、别名、固定 ID 和 scope（work vs personal）。
@@ -87,7 +98,8 @@ SYSTEM_PROMPT = """你是一个跨设备、跨端（Antigravity / Codex / Claude
 5. 每条进展和随想填写支持本条描述的 sources。session 的 id 必须逐字取自对应会话的 id，
    commit 的 id 必须逐字取自对应仓库 commits 中的 hash，file 的 id 必须逐字取自文件组的 paths。
    仅引用能明确支持本条内容的记录；不能确认时用空数组。同名项目、同日或同工作目录本身不足以证明关联。
-   工作目录和 Git 改动文件由程序从原始记录补全，无需提供。"""
+   工作目录和 Git 改动文件由程序从原始记录补全，无需提供。
+6. candidate_decisions 宁缺毋滥（每天最多 5 条），仅记录真正有长期复用价值的硬约束、避坑结论或架构选型。"""
 
 
 def _compact_raw_for_llm(raw_payload: dict[str, Any], existing_projects: list[dict[str, Any]]) -> dict[str, Any]:
@@ -110,7 +122,7 @@ def _compact_raw_for_llm(raw_payload: dict[str, Any], existing_projects: list[di
             )
         return out
 
-    return {
+    return redact.redact_obj({
         "workday": raw_payload.get("workday", ""),
         "weekday": raw_payload.get("weekday", ""),
         "machines": raw_payload.get("machines") or ([raw_payload["machine"]] if raw_payload.get("machine") else []),
@@ -127,7 +139,7 @@ def _compact_raw_for_llm(raw_payload: dict[str, Any], existing_projects: list[di
         "workbuddy": trim_sessions(raw_payload.get("workbuddy") or []),
         "git": (raw_payload.get("git") or [])[:30],
         "files": (raw_payload.get("files") or [])[:30],
-    }
+    })
 
 
 def collect_existing_projects_from_history(data_dir: str) -> list[dict[str, Any]]:
@@ -250,6 +262,26 @@ def normalize_summary_schema(
     }
     if machines:
         out["machines"] = machines
+    cand_decs = summary.get("candidate_decisions")
+    if isinstance(cand_decs, list) and cand_decs:
+        clean_decs: list[dict[str, Any]] = []
+        for cd in cand_decs[:5]:
+            if not isinstance(cd, dict):
+                continue
+            txt = str(cd.get("text") or "").strip()
+            if len(txt) < 6:
+                continue
+            clean_decs.append(
+                {
+                    "scope": str(cd.get("scope") or "project").strip().lower(),
+                    "project": str(cd.get("project") or "").strip(),
+                    "kind": str(cd.get("kind") or "decision").strip().lower(),
+                    "text": redact.redact_text(txt),
+                    "tags": [str(t).strip() for t in (cd.get("tags") or []) if str(t).strip()][:8],
+                }
+            )
+        if clean_decs:
+            out["candidate_decisions"] = clean_decs
     return verify_day_sources(out, raw_payload)
 
 

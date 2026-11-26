@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Collect daily work traces from Antigravity, Codex, Git, and local project directories."""
 
+from __future__ import annotations
+
 import argparse
 from collections import defaultdict
 from contextlib import closing
@@ -18,6 +20,7 @@ from zoneinfo import ZoneInfo
 
 import multi_machine
 import query_memory
+import redact
 import remote_client
 
 try:
@@ -1279,7 +1282,7 @@ def build_day_payload(
         datetime.strptime(workday, "%Y-%m-%d").weekday()
     ]
 
-    return {
+    payload = {
         "workday": workday,
         "weekday": weekday_cn,
         "machine": mid,
@@ -1307,6 +1310,7 @@ def build_day_payload(
         "git": multi_machine.tag_items_with_machine(git_items, mid),
         "files": multi_machine.tag_items_with_machine(file_groups, mid),
     }
+    return redact.redact_with_cfg(payload, cfg)
 
 
 def collect_day(workday: str, cfg: dict[str, Any], machine_id: str | None = None) -> dict[str, Any]:
@@ -1616,6 +1620,7 @@ def collect_all_history_single_pass(cfg: dict[str, Any], end_workday: str) -> li
             "git": [],
             "files": [],
         }
+        payload = redact.redact_with_cfg(payload, cfg)
         raw_month_dir = os.path.join(DATA_DIR, "raw", wd[:7])
         os.makedirs(raw_month_dir, exist_ok=True)
         with open(os.path.join(raw_month_dir, f"raw_{wd}.json"), "w", encoding="utf-8") as f:

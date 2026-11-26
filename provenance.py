@@ -1,5 +1,7 @@
 """Bind each progress item to explicit evidence from its workday's raw archive."""
 
+from __future__ import annotations
+
 from collections import defaultdict
 from typing import Any
 

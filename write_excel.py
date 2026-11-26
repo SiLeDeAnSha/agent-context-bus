@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Write or idempotently update polished Work (3-sheet) & Personal Tech (4-sheet) Excel workbooks."""
 
+from __future__ import annotations
+
 import argparse
 from collections import defaultdict
 import glob
@@ -914,6 +916,21 @@ def sync_json_indexes(days: list[dict[str, Any]], data_dir: str | None = None) -
     ordered_all = [by_day[wd] for wd in sorted(by_day.keys())]
     with open(master_path, "w", encoding="utf-8") as f:
         json.dump({"days": ordered_all}, f, ensure_ascii=False, indent=2)
+    try:
+        import decisions as dec_mod
+
+        for d in days:
+            if d.get("candidate_decisions"):
+                dec_mod.ingest_candidate_decisions(target_data, ordered_all, d)
+    except Exception:
+        pass
+    try:
+        import search_fts
+
+        if os.path.exists(search_fts.index_db_path(target_data)):
+            search_fts.rebuild_structured_index(target_data, days=ordered_all)
+    except Exception:
+        pass
     return {"total_days": len(ordered_all), "updated_months": len(touched_months)}
 
 

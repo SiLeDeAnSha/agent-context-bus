@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Agent Context Bus · 记忆中枢看板</title>
+<style>
+  :root {
+    --bg: #f6f6f4;
+    --surface: #ffffff;
+    --ink: #111111;
+    --muted: #666662;
+    --border: #dfdfd9;
+    --accent: #e03e2d;
+    --accent-soft: #fdf0ee;
+    --ok: #1b7f4d;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Helvetica Neue", "PingFang SC", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: var(--sans); background: var(--bg); color: var(--ink); line-height: 1.5; }
+  header {
+    background: var(--surface); border-bottom: 2px solid var(--ink);
+    padding: 16px 24px; display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap;
+  }
+  .brand { display: flex; align-items: baseline; gap: 10px; }
+  .brand h1 { margin: 0; font-size: 18px; letter-spacing: -0.02em; font-weight: 700; }
+  .brand span { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  nav { display: flex; gap: 8px; flex-wrap: wrap; }
+  nav button {
+    border: 1px solid var(--border); background: var(--surface); color: var(--ink);
+    padding: 6px 14px; font-size: 13px; font-weight: 600; cursor: pointer;
+  }
+  nav button.active { background: var(--ink); color: #fff; border-color: var(--ink); }
+  .auth-bar { display: flex; gap: 8px; align-items: center; }
+  input, select, textarea {
+    border: 1px solid var(--border); background: var(--surface); color: var(--ink);
+    padding: 7px 10px; font-size: 13px; font-family: inherit;
+  }
+  .btn {
+    border: 1px solid var(--ink); background: var(--ink); color: #fff;
+    padding: 7px 14px; font-size: 13px; font-weight: 600; cursor: pointer;
+  }
+  .btn.secondary { background: var(--surface); color: var(--ink); }
+  .btn.danger { border-color: var(--accent); background: var(--accent); color: #fff; }
+  main { max-width: 1200px; margin: 24px auto; padding: 0 20px 60px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; margin-bottom: 20px; }
+  .card { background: var(--surface); border: 1px solid var(--border); padding: 16px; }
+  .kpi-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+  .kpi-value { font-size: 26px; font-weight: 700; font-family: var(--mono); margin-top: 4px; }
+  .panel { background: var(--surface); border: 1px solid var(--border); padding: 18px; margin-bottom: 16px; }
+  .panel h2 { margin: 0 0 12px; font-size: 15px; border-left: 3px solid var(--accent); padding-left: 10px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); background: #fafaf8; }
+  code { font-family: var(--mono); font-size: 12px; background: #f1f1ed; padding: 1px 5px; }
+  .badge { display: inline-block; font-size: 11px; font-family: var(--mono); padding: 2px 6px; border: 1px solid var(--border); }
+  .badge.active { border-color: var(--ok); color: var(--ok); }
+  .badge.superseded { color: var(--muted); text-decoration: line-through; }
+  .badge.constraint { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+  .row-form { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+  .row-form input, .row-form select { flex: 1 1 180px; }
+  .muted { color: var(--muted); font-size: 12px; }
+  .hidden { display: none; }
+  .toast { position: fixed; bottom: 20px; right: 20px; background: var(--ink); color: #fff; padding: 10px 16px; font-size: 13px; display: none; }
+  .copy-btn { border: 1px solid var(--border); background: #fafaf8; font-family: var(--mono); font-size: 11px; padding: 2px 6px; cursor: pointer; margin: 2px 4px 2px 0; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <h1>AGENT CONTEXT BUS</h1>
+    <span id="status-pill">未连接</span>
+  </div>
+  <nav>
+    <button data-tab="overview" class="active">总览 & 实时层</button>
+    <button data-tab="search">FTS5 搜索</button>
+    <button data-tab="projects">项目与路径</button>
+    <button data-tab="decisions">决策与避坑</button>
+  </nav>
+  <div class="auth-bar">
+    <input id="token-input" type="password" placeholder="输入 Bearer Token（仅存本标签页）" style="width:230px" />
+    <button class="btn" id="connect-btn">连接</button>
+  </div>
+</header>
+
+<main>
+  <section id="tab-overview">
+    <div class="grid" id="kpi-grid"></div>
+    <div class="panel">
+      <h2>快速记一笔（0-Token 实时层）</h2>
+      <div class="row-form">
+        <input id="note-project" placeholder="项目名称或别名" />
+        <input id="note-text" placeholder="刚完成的关键结论或改动..." style="flex:2 1 320px" />
+        <input id="note-path" placeholder="可选：附带路径" />
+        <button class="btn" id="note-submit">写入笔记</button>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>今日多机实时动态（未压实 WAL）</h2>
+      <div id="live-container" class="muted">请先输入 Token 并点击连接。</div>
+    </div>
+  </section>
+
+  <section id="tab-search" class="hidden">
+    <div class="panel">
+      <h2>FTS5 中文模糊与 BM25 检索</h2>
+      <div class="row-form">
+        <input id="q-keyword" placeholder="输入关键词（支持中文片段模糊与多词排序）" style="flex:2 1 300px" />
+        <select id="q-scope">
+          <option value="all">全部维度</option>
+          <option value="work">正式工作 (work)</option>
+          <option value="personal">个人技术 (personal)</option>
+          <option value="life">随想 (life)</option>
+        </select>
+        <input id="q-machine" placeholder="可选：筛选主机 ID" />
+        <button class="btn" id="q-btn">搜索</button>
+      </div>
+      <div id="search-results" class="muted">输入关键词开始检索。</div>
+    </div>
+  </section>
+
+  <section id="tab-projects" class="hidden">
+    <div class="panel">
+      <h2>项目总览与关键路径（点击路径复制）</h2>
+      <div class="row-form">
+        <input id="proj-filter" placeholder="过滤项目名 / 分类 / 路径" />
+        <select id="proj-scope">
+          <option value="all">全部维度</option>
+          <option value="work">正式工作</option>
+          <option value="personal">个人技术</option>
+        </select>
+        <button class="btn secondary" id="proj-refresh">刷新</button>
+      </div>
+      <div id="projects-table" class="muted">尚未加载。</div>
+    </div>
+  </section>
+
+  <section id="tab-decisions" class="hidden">
+    <div class="panel">
+      <h2>新增长期决策 / 硬约束 / 避坑记录</h2>
+      <div class="row-form">
+        <select id="dec-scope">
+          <option value="project">项目级</option>
+          <option value="global">全局跨项目</option>
+        </select>
+        <input id="dec-project" placeholder="项目名（全局可留空）" />
+        <select id="dec-kind">
+          <option value="decision">决策 (decision)</option>
+          <option value="constraint">硬约束 (constraint)</option>
+          <option value="pitfall">避坑 (pitfall)</option>
+        </select>
+        <input id="dec-tags" placeholder="标签（逗号分隔）" />
+      </div>
+      <div class="row-form">
+        <input id="dec-text" placeholder="记录长期有效结论或避坑约束..." style="flex:3 1 420px" />
+        <button class="btn" id="dec-submit">保存决策</button>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>决策与避坑清单</h2>
+      <div class="row-form">
+        <input id="dec-filter" placeholder="搜索决策内容 / 项目 / 标签" />
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px">
+          <input type="checkbox" id="dec-all-status" /> 显示已淘汰 / 软删
+        </label>
+        <button class="btn secondary" id="dec-refresh">刷新</button>
+      </div>
+      <div id="decisions-list" class="muted">尚未加载。</div>
+    </div>
+  </section>
+</main>
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s || "").replace(/[&<>"']/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+
+function toast(msg) {
+  const el = $("toast");
+  el.textContent = msg;
+  el.style.display = "block";
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => { el.style.display = "none"; }, 2600);
+}
+
+function getToken() { return sessionStorage.getItem("acb_token") || ""; }
+
+async function api(path, opts = {}) {
+  const headers = Object.assign({ "Accept": "application/json" }, opts.headers || {});
+  const tok = getToken();
+  if (tok) headers["Authorization"] = "Bearer " + tok;
+  if (opts.json !== undefined) {
+    headers["Content-Type"] = "application/json";
+    opts.body = JSON.stringify(opts.json);
+  }
+  const resp = await fetch(path, Object.assign({}, opts, { headers }));
+  if (resp.status === 401) throw new Error("鉴权失败 (401)：请检查 Bearer Token");
+  const text = await resp.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : {}; } catch { data = text; }
+  if (!resp.ok) throw new Error((data && data.error) ? data.error : ("HTTP " + resp.status));
+  return data;
+}
+
+async function loadOverview() {
+  const [st, live] = await Promise.all([api("/api/v1/status"), api("/api/v1/live")]);
+  $("status-pill").textContent = "已连接 · 最新 " + (st.latest_workday || "-");
+  $("kpi-grid").innerHTML = [
+    ["历史覆盖天数", st.total_days || 0],
+    ["已同步设备", (st.machines || []).length],
+    ["FTS5 文档数", Object.values((st.fts_index || {}).counts || {}).reduce((a, b) => a + b, 0)],
+    ["有效长期决策", st.active_decisions || 0],
+  ].map(([k, v]) => `<div class="card"><div class="kpi-label">${esc(k)}</div><div class="kpi-value">${esc(v)}</div></div>`).join("");
+
+  const days = live.live_days || [];
+  if (!days.length) {
+    $("live-container").innerHTML = "<p class='muted'>今日暂无未压实实时动态。</p>";
+    return;
+  }
+  $("live-container").innerHTML = days.map((d) => {
+    const notes = (d.notes || []).map((n) => `<li><code>${esc(n.time)}</code> <b>${esc(n.project)}</b>${n.machine ? ` <code>@${esc(n.machine)}</code>` : ""}: ${esc(n.text)}</li>`).join("");
+    const sess = (d.sessions || []).map((s) => `<tr><td><code>${esc(s.time)}</code></td><td>${esc(s.tool)}${s.machine ? ` <code>@${esc(s.machine)}</code>` : ""}</td><td>${esc(s.title)}</td><td>${esc(s.summary || s.last_input || "-")}</td></tr>`).join("");
+    return `<h3>${esc(d.workday)} <span class="muted">刷新 ${esc((d.updated_at || "").slice(11, 16))}</span></h3>`
+      + (notes ? `<ul>${notes}</ul>` : "")
+      + (sess ? `<table><thead><tr><th>时间</th><th>客户端</th><th>标题</th><th>最新动态</th></tr></thead><tbody>${sess}</tbody></table>` : "");
+  }).join("");
+}
+
+async function runSearch() {
+  const kw = $("q-keyword").value.trim();
+  if (!kw) return;
+  const qs = new URLSearchParams({ keyword: kw, scope: $("q-scope").value, format: "json", limit: "25" });
+  if ($("q-machine").value.trim()) qs.set("machine", $("q-machine").value.trim());
+  const res = await api("/api/v1/query?" + qs.toString());
+  const decs = (res.decisions || []).map((d) => `<div style="margin-bottom:8px"><span class="badge constraint">${esc(d.kind)}</span> <b>${esc(d.project || "全局")}</b>: ${esc(d.text)}</div>`).join("");
+  const rows = (res.hits || []).map((h) => `<tr><td><code>${esc(h.workday)}</code></td><td>${esc(h.tool)}${h.machine ? ` @${esc(h.machine)}` : ""}</td><td><b>${esc(h.project)}</b></td><td>${esc(h.summary)}</td></tr>`).join("");
+  $("search-results").innerHTML = (decs ? `<div class="panel" style="background:#fafaf8">${decs}</div>` : "")
+    + (rows ? `<table><thead><tr><th>日期</th><th>工具</th><th>项目</th><th>摘要</th></tr></thead><tbody>${rows}</tbody></table>` : "<p class='muted'>无匹配结果。</p>");
+}
+
+async function loadProjects() {
+  const qs = new URLSearchParams({ scope: $("proj-scope").value, format: "json" });
+  if ($("proj-filter").value.trim()) qs.set("keyword", $("proj-filter").value.trim());
+  const projs = await api("/api/v1/projects?" + qs.toString());
+  if (!projs.length) { $("projects-table").innerHTML = "<p class='muted'>无项目。</p>"; return; }
+  $("projects-table").innerHTML = `<table><thead><tr><th>项目</th><th>状态</th><th>最近更新</th><th>关键路径</th><th>最近进展</th></tr></thead><tbody>`
+    + projs.map((p) => {
+      const paths = (p.paths || []).map((x) => `<button class="copy-btn" data-copy="${esc(x)}">${esc(x)}</button>`).join("") || "-";
+      return `<tr><td><b>${esc(p.project)}</b><div class="muted">${esc(p.category)}</div></td><td><span class="badge">${esc(p.status)}</span></td><td><code>${esc(p.last_date)}</code></td><td>${paths}</td><td>${esc(p.latest_summary)}</td></tr>`;
+    }).join("") + `</tbody></table>`;
+  $("projects-table").querySelectorAll(".copy-btn").forEach((b) => {
+    b.onclick = () => { navigator.clipboard.writeText(b.dataset.copy); toast("已复制路径：" + b.dataset.copy); };
+  });
+}
+
+async function loadDecisions() {
+  const qs = new URLSearchParams({ limit: "80" });
+  if ($("dec-filter").value.trim()) qs.set("keyword", $("dec-filter").value.trim());
+  if ($("dec-all-status").checked) qs.set("all_status", "1");
+  const res = await api("/api/v1/decisions?" + qs.toString());
+  const items = res.decisions || [];
+  if (!items.length) { $("decisions-list").innerHTML = "<p class='muted'>暂无决策记录。</p>"; return; }
+  $("decisions-list").innerHTML = `<table><thead><tr><th>ID / 类型</th><th>归属</th><th>内容</th><th>状态</th><th>操作</th></tr></thead><tbody>`
+    + items.map((d) => {
+      const act = d.status === "active"
+        ? `<button class="btn secondary" style="padding:3px 8px;font-size:12px" data-sup="${esc(d.id)}">淘汰替换</button> <button class="btn danger" style="padding:3px 8px;font-size:12px" data-del="${esc(d.id)}">软删</button>`
+        : `<span class="muted">${esc(d.superseded_by || "-")}</span>`;
+      return `<tr><td><code>${esc(d.id)}</code><div><span class="badge constraint">${esc(d.kind)}</span></div></td><td>${esc(d.scope === "global" ? "全局" : d.project)}</td><td>${esc(d.text)}</td><td><span class="badge ${esc(d.status)}">${esc(d.status)}</span></td><td>${act}</td></tr>`;
+    }).join("") + `</tbody></table>`;
+  $("decisions-list").querySelectorAll("[data-sup]").forEach((b) => {
+    b.onclick = async () => {
+      const next = prompt("输入替代的新决策/约束内容：");
+      if (!next || !next.trim()) return;
+      try {
+        await api("/api/v1/decisions", { method: "POST", json: { action: "supersede", old_id: b.dataset.sup, text: next.trim() } });
+        toast("已淘汰旧决策并写入新版本");
+        loadDecisions();
+      } catch (e) { toast(e.message); }
+    };
+  });
+  $("decisions-list").querySelectorAll("[data-del]").forEach((b) => {
+    b.onclick = async () => {
+      if (!confirm("确认软删除决策 " + b.dataset.del + " ？")) return;
+      try {
+        await api("/api/v1/decisions", { method: "POST", json: { action: "forget", id: b.dataset.del } });
+        toast("已软删除");
+        loadDecisions();
+      } catch (e) { toast(e.message); }
+    };
+  });
+}
+
+document.querySelectorAll("nav button").forEach((btn) => {
+  btn.onclick = () => {
+    document.querySelectorAll("nav button").forEach((x) => x.classList.remove("active"));
+    btn.classList.add("active");
+    ["overview", "search", "projects", "decisions"].forEach((t) => {
+      $("tab-" + t).classList.toggle("hidden", t !== btn.dataset.tab);
+    });
+    if (btn.dataset.tab === "projects") loadProjects().catch((e) => toast(e.message));
+    if (btn.dataset.tab === "decisions") loadDecisions().catch((e) => toast(e.message));
+  };
+});
+
+$("connect-btn").onclick = async () => {
+  const val = $("token-input").value.trim();
+  if (val) sessionStorage.setItem("acb_token", val);
+  try { await loadOverview(); toast("已连接 Agent Context Bus Hub"); }
+  catch (e) { $("status-pill").textContent = "连接失败"; toast(e.message); }
+};
+$("note-submit").onclick = async () => {
+  const project = $("note-project").value.trim(), text = $("note-text").value.trim();
+  const path = $("note-path").value.trim();
+  if (!project || !text) { toast("请填写项目和笔记内容"); return; }
+  try {
+    await api("/api/v1/notes", { method: "POST", json: { project, text, paths: path ? [path] : [] } });
+    $("note-text").value = ""; $("note-path").value = "";
+    toast("已写入实时笔记");
+    loadOverview();
+  } catch (e) { toast(e.message); }
+};
+$("dec-submit").onclick = async () => {
+  const scope = $("dec-scope").value, project = $("dec-project").value.trim();
+  const kind = $("dec-kind").value, text = $("dec-text").value.trim(), tags = $("dec-tags").value.trim();
+  if (!text) { toast("请填写决策内容"); return; }
+  try {
+    await api("/api/v1/decisions", { method: "POST", json: { action: "add", scope, project, kind, text, tags } });
+    $("dec-text").value = "";
+    toast("已保存决策");
+    loadDecisions();
+  } catch (e) { toast(e.message); }
+};
+$("q-btn").onclick = () => runSearch().catch((e) => toast(e.message));
+$("q-keyword").onkeydown = (e) => { if (e.key === "Enter") runSearch().catch((err) => toast(err.message)); };
+$("proj-refresh").onclick = () => loadProjects().catch((e) => toast(e.message));
+$("dec-refresh").onclick = () => loadDecisions().catch((e) => toast(e.message));
+
+if (getToken()) { $("token-input").value = getToken(); loadOverview().catch(() => {}); }
+</script>
+</body>
+</html>

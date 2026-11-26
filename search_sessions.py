@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Find verbatim excerpts in the AI clients' local session stores."""
 
+from __future__ import annotations
+
 import argparse
 from datetime import date, datetime, timedelta, timezone
 import heapq
 import json
+import os
 from pathlib import Path
 import re
 import sys
@@ -19,7 +22,7 @@ from collect import (
     parse_iso_dt,
     parse_workbuddy_ts,
 )
-from query_memory import load_config
+from query_memory import DEFAULT_DATA_DIR, load_config
 
 
 CLIENTS = ("antigravity", "codex", "claude", "workbuddy")
@@ -228,6 +231,8 @@ def main():
     parser.add_argument("--from", dest="date_from", type=date.fromisoformat, help="First workday, inclusive.")
     parser.add_argument("--to", dest="date_to", type=date.fromisoformat, help="Last workday, inclusive.")
     parser.add_argument("--limit", type=int, default=5, help="Maximum excerpts, newest first (1-50, default: 5).")
+    parser.add_argument("--no-index", action="store_true", help="Bypass SQLite FTS5 session index and scan JSONL files directly.")
+    parser.add_argument("--data-dir", default=None, help="Override data directory for derived FTS5 index.")
     parser.add_argument("--json", action="store_true", help="Return excerpt records as JSON.")
     args = parser.parse_args()
     if not args.keyword.strip():
@@ -240,17 +245,54 @@ def main():
         parser.error("--from must be on or before --to")
 
     cfg = load_config()
-    tz = ZoneInfo(cfg.get("timezone", "Asia/Shanghai"))
+    tz_name = cfg.get("timezone", "Asia/Shanghai")
+    tz = ZoneInfo(tz_name)
     day_start = int(cfg.get("day_start_hour", 5))
     first, last = args.date or args.date_from, args.date or args.date_to
     offset = timedelta(hours=day_start)
     start = datetime.combine(first, datetime.min.time(), tz) + offset if first else None
     end = datetime.combine(last, datetime.min.time(), tz) + offset + timedelta(days=1) if last else None
-    pattern = re.compile(re.escape(args.keyword), re.IGNORECASE)
-    errors = []
-    hits = find_matches((args.client,) if args.client else CLIENTS, set(args.session_id or []),
-                        pattern, start, end, tz, day_start, errors)
-    results = [hit for _, hit in heapq.nlargest(args.limit, hits, key=lambda pair: pair[0])]
+    clients = (args.client,) if args.client else CLIENTS
+    ids = set(args.session_id or [])
+    errors: list[str] = []
+
+    results: list[dict] = []
+    cutoff_date = (datetime.now(tz) - timedelta(days=30)).date()
+    within_fts_window = (first is None or first >= cutoff_date)
+    data_dir = args.data_dir or os.environ.get("DAILY_MEMORY_DATA_DIR") or DEFAULT_DATA_DIR
+
+    if not args.no_index and within_fts_window:
+        try:
+            import search_fts
+
+            search_fts.sync_sessions_to_fts(
+                data_dir,
+                days=30,
+                clients=clients,
+                tz_name=tz_name,
+                day_start_hour=day_start,
+                cfg=cfg,
+            )
+            fts_hits = search_fts.search(
+                data_dir,
+                args.keyword,
+                doc_types=("session_turn",),
+                clients=clients,
+                session_ids=ids or None,
+                exact_date=args.date.isoformat() if args.date else None,
+                date_from=args.date_from.isoformat() if args.date_from else None,
+                date_to=args.date_to.isoformat() if args.date_to else None,
+                limit=args.limit,
+                auto_sync_structured=False,
+            )
+            results = [h["payload"] for h in fts_hits if isinstance(h.get("payload"), dict)]
+        except Exception:
+            results = []
+
+    if not results:
+        pattern = re.compile(re.escape(args.keyword), re.IGNORECASE)
+        hits = find_matches(clients, ids, pattern, start, end, tz, day_start, errors)
+        results = [hit for _, hit in heapq.nlargest(args.limit, hits, key=lambda pair: pair[0])]
     for error in errors:
         print(f"读取原会话失败：{error}", file=sys.stderr)
     if args.json:

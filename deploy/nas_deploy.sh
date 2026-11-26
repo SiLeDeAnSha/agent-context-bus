@@ -81,6 +81,7 @@ run_cmd ssh "${SSH_OPTS[@]}" "${SSH_TARGET}" \
 echo "[2/5] Syncing server application code..."
 run_cmd rsync -avz --delete \
   -e "${RSYNC_SSH}" \
+  --filter='P server/.env' \
   --include='/multi_machine.py' \
   --include='/remote_client.py' \
   --include='/query_memory.py' \
@@ -89,8 +90,16 @@ run_cmd rsync -avz --delete \
   --include='/provenance.py' \
   --include='/project_identity.py' \
   --include='/export_report.py' \
+  --include='/redact.py' \
+  --include='/decisions.py' \
+  --include='/search_fts.py' \
+  --include='/live_memory.py' \
+  --include='/doctor.py' \
+  --include='/adapters/' \
+  --include='/adapters/*.py' \
   --include='/server/' \
   --include='/server/app.py' \
+  --include='/server/ui.html' \
   --include='/server/Dockerfile' \
   --include='/server/docker-compose.yml' \
   --include='/server/.env.example' \

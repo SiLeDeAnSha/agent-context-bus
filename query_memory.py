@@ -19,9 +19,11 @@ import sys
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import decisions as dec_mod
 import live_memory
 import multi_machine
 import remote_client
+import search_fts
 from project_identity import ProjectCatalog, edit_registry, item_name, load_registry, name_key
 from provenance import SOURCE_ARCHIVE_MISSING, SOURCE_PENDING, SOURCE_RECORDED, SourceIndex, format_sources, source_key
 
@@ -326,6 +328,7 @@ def render_memory_index(
     now_str: str | None = None,
     catalog: ProjectCatalog | None = None,
     live_days: list[dict[str, Any]] | None = None,
+    active_decisions: list[dict[str, Any]] | None = None,
 ) -> str:
     ordered_days = sorted(days, key=lambda d: str(d.get("workday", "")))
     archived_workdays = {str(d.get("workday", "")) for d in ordered_days}
@@ -425,6 +428,16 @@ def render_memory_index(
             )
         lines.append("")
 
+    top_decisions = [d for d in (active_decisions or []) if str(d.get("status") or "active") == "active"][:12]
+    if top_decisions:
+        kind_badge = {"decision": "决策", "constraint": "硬约束", "pitfall": "避坑"}
+        lines.extend(["## 关键约束与长期决策（有效置顶）", ""])
+        for d in top_decisions:
+            badge = kind_badge.get(str(d.get("kind") or "decision"), "决策")
+            scope_lbl = "全局" if d.get("scope") == "global" else clean_cell(d.get("project"), 32)
+            lines.append(f"- `{d.get('id', '')}` **{badge}** [{scope_lbl}]：{clean_cell(d.get('text'), 130)}")
+        lines.append("")
+
     def append_scope_table(title: str, projs: list[dict[str, Any]]) -> None:
         lines.extend([f"## {title}（{len(projs)} 项，按最近更新倒序）", ""])
         if not projs:
@@ -487,13 +500,22 @@ def generate_memory_index(
     catalog: ProjectCatalog | None = None,
     data_dir: str | None = None,
     live_days: list[dict[str, Any]] | None = None,
+    active_decisions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     target = os.path.expanduser(output_path or resolve_index_path())
     ordered = sorted(days, key=lambda d: str(d.get("workday", "")))
     if live_days is None and data_dir:
         archived = {str(d.get("workday", "")) for d in ordered}
-        live_days = live_memory.load_uncompacted_live(data_dir, archived_workdays=archived)
-    content = render_memory_index(days, tz_name=tz_name, catalog=catalog, live_days=live_days)
+        live_days = multi_machine.load_merged_live_days(data_dir, archived_workdays=archived)
+    if active_decisions is None and data_dir:
+        active_decisions = dec_mod.query_decisions(data_dir, limit=12)
+    content = render_memory_index(
+        days,
+        tz_name=tz_name,
+        catalog=catalog,
+        live_days=live_days,
+        active_decisions=active_decisions,
+    )
     out_dir = os.path.dirname(os.path.abspath(target))
     os.makedirs(out_dir, exist_ok=True)
     tmp_path = target + ".tmp.md"
@@ -662,7 +684,7 @@ def query_project_timeline(
 
     projects = sorted(matched_projects.values(), key=lambda p: p["project"])
     archived = {str(d.get("workday", "")) for d in days}
-    uncompacted = live_memory.load_uncompacted_live(data_dir, archived_workdays=archived)
+    uncompacted = multi_machine.load_merged_live_days(data_dir, archived_workdays=archived)
     live_hits: list[dict[str, Any]] = []
     if uncompacted:
         if len(projects) == 1:
@@ -671,6 +693,16 @@ def query_project_timeline(
             live_hits = live_memory.search_live_entries(uncompacted, project_identity=exact_match)
         else:
             live_hits = live_memory.search_live_entries(uncompacted, terms=terms)
+
+    target_ident = projects[0] if len(projects) == 1 else exact_match
+    proj_decs = (
+        dec_mod.query_decisions(data_dir, project_identity=target_ident, include_inactive=True, limit=30)
+        if target_ident is not None
+        else dec_mod.query_decisions(data_dir, project=project_query, include_inactive=True, limit=30, catalog=catalog)
+    )
+    active_decs = [d for d in proj_decs if d.get("status") == "active"]
+    superseded_decs = [d for d in proj_decs if d.get("status") == "superseded"]
+
     return {
         "query": project_query,
         "matched_projects": [p["project"] for p in projects],
@@ -678,6 +710,8 @@ def query_project_timeline(
         "total_matches": len(entries),
         "entries": sliced,
         "live": live_hits[:10],
+        "decisions": active_decs[:15],
+        "superseded_decisions": superseded_decs[:10],
         "raw": raw_details,
     }
 
@@ -693,10 +727,103 @@ def query_keyword(
     machine_filter: str | None = None,
     asc: bool = False,
     catalog: ProjectCatalog | None = None,
+    use_fts: bool = True,
 ) -> dict[str, Any]:
     terms = parse_terms(keyword)
     catalog = catalog if catalog is not None else ProjectCatalog(days, load_registry(data_dir))
     exact_project = catalog.lookup(keyword)
+    archived = {str(d.get("workday", "")) for d in days}
+
+    # Prefer SQLite FTS5 (unicode61 + trigram + BM25 + RRF) when disk store exists for data_dir
+    disk_master = os.path.join(data_dir, "summary_all_history.json") if data_dir else ""
+    if use_fts and not asc and data_dir and os.path.exists(disk_master):
+        try:
+            date_bounds = sorted(str(d.get("workday") or "") for d in days if d.get("workday"))
+            date_from = date_bounds[0] if date_bounds else None
+            date_to = date_bounds[-1] if date_bounds else None
+            fts_results = search_fts.search(
+                data_dir,
+                keyword,
+                doc_types=("work_item", "life_item", "live_note", "live_session", "live_git", "decision"),
+                scope=scope,
+                status_filter=status_filter,
+                machine_filter=machine_filter,
+                date_from=date_from,
+                date_to=date_to,
+                limit=max(limit * 2, 30),
+                auto_sync_structured=True,
+            )
+            hits_fts: list[dict[str, Any]] = []
+            live_fts: list[dict[str, Any]] = []
+            decs_fts: list[dict[str, Any]] = []
+            allowed_days = {str(d.get("workday") or "") for d in days}
+            for item in fts_results:
+                dt = item["doc_type"]
+                p = item["payload"]
+                if dt == "decision":
+                    if p.get("status") == "active":
+                        decs_fts.append(p)
+                elif dt in ("live_note", "live_session", "live_git"):
+                    if str(p.get("workday") or "") not in archived:
+                        live_fts.append(p)
+                elif dt == "work_item":
+                    if allowed_days and str(p.get("workday") or "") not in allowed_days:
+                        continue
+                    ident = catalog.for_item(p)
+                    hits_fts.append(
+                        {
+                            "kind": "work_item",
+                            "workday": p.get("workday", ""),
+                            "scope": p.get("scope", "personal"),
+                            **ident,
+                            "project_label": p.get("project", ""),
+                            "tool": p.get("tool", ""),
+                            "machine": p.get("machine", ""),
+                            "session_name": p.get("session_name", ""),
+                            "status": p.get("status", ""),
+                            "summary": p.get("summary", ""),
+                            "outputs": p.get("outputs", ""),
+                            "next_step": p.get("next_step", ""),
+                            "score": item["score"],
+                            **source_fields(p),
+                        }
+                    )
+                elif dt == "life_item":
+                    if allowed_days and str(p.get("workday") or "") not in allowed_days:
+                        continue
+                    hits_fts.append(
+                        {
+                            "kind": "life_item",
+                            "workday": p.get("workday", ""),
+                            "scope": "life",
+                            "project": p.get("topic", ""),
+                            "tool": p.get("tool", ""),
+                            "machine": p.get("machine", ""),
+                            "session_name": p.get("session_name", ""),
+                            "status": "-",
+                            "summary": p.get("summary", ""),
+                            "outputs": "-",
+                            "next_step": "-",
+                            "score": item["score"],
+                            **source_fields(p),
+                        }
+                    )
+            if hits_fts or live_fts or decs_fts:
+                sliced_fts = hits_fts[:limit]
+                raw_hits = raw_for_results(sliced_fts, data_dir, machine_filter) if include_raw else []
+                return {
+                    "query": keyword,
+                    "scope": scope,
+                    "search_mode": "fts5",
+                    "total_matches": len(hits_fts),
+                    "hits": sliced_fts,
+                    "live": live_fts[:10],
+                    "decisions": decs_fts[:8],
+                    "raw": raw_hits,
+                }
+        except Exception:
+            pass
+
     hits: list[dict[str, Any]] = []
 
     for d in sorted(days, key=lambda x: str(x.get("workday", "")), reverse=not asc):
@@ -784,20 +911,22 @@ def query_keyword(
 
     sliced = hits[:limit]
     raw_hits = raw_for_results(sliced, data_dir, machine_filter) if include_raw else []
-    archived = {str(d.get("workday", "")) for d in days}
-    uncompacted = live_memory.load_uncompacted_live(data_dir, archived_workdays=archived)
+    uncompacted = multi_machine.load_merged_live_days(data_dir, archived_workdays=archived)
     live_hits = (
         live_memory.search_live_entries(uncompacted, terms=terms)
         if uncompacted and not status_filter and not machine_filter
         else []
     )
+    matched_decs = dec_mod.query_decisions(data_dir, keyword=keyword, limit=8) if data_dir else []
 
     return {
         "query": keyword,
         "scope": scope,
+        "search_mode": "exact",
         "total_matches": len(hits),
         "hits": sliced,
         "live": live_hits[:10],
+        "decisions": matched_decs,
         "raw": raw_hits,
     }
 
@@ -868,6 +997,7 @@ def query_by_keyword(
     asc: bool = False,
     limit: int = 15,
     catalog: ProjectCatalog | None = None,
+    use_fts: bool = True,
 ) -> dict[str, Any]:
     return query_keyword(
         days,
@@ -880,6 +1010,7 @@ def query_by_keyword(
         machine_filter=machine_filter,
         asc=asc,
         catalog=catalog,
+        use_fts=use_fts,
     )
 
 
@@ -1001,6 +1132,25 @@ def format_live_section(live_items: list[dict[str, Any]]) -> list[str]:
     return lines
 
 
+def format_decisions_section(
+    active_decs: list[dict[str, Any]],
+    superseded_decs: list[dict[str, Any]] | None = None,
+) -> list[str]:
+    if not active_decs and not superseded_decs:
+        return []
+    kind_badge = {"decision": "决策", "constraint": "硬约束", "pitfall": "避坑"}
+    lines = ["", "### 有效长期决策与避坑约束"]
+    for d in active_decs:
+        badge = kind_badge.get(str(d.get("kind") or "decision"), "决策")
+        scope_lbl = "全局" if d.get("scope") == "global" else str(d.get("project") or "")
+        conf = " [候选]" if d.get("confidence") == "candidate" else ""
+        lines.append(f"- `{d.get('id', '')}` **{badge}** [{scope_lbl}]{conf}：{d.get('text', '')}")
+    if superseded_decs:
+        sup_ids = ", ".join(f"`{d.get('id', '')}`" for d in superseded_decs[:5])
+        lines.append(f"- _已淘汰历史方案 {len(superseded_decs)} 条（{sup_ids}，可用 `--decisions --all-status` 查看）_")
+    return lines
+
+
 def format_project_query_md(res: dict[str, Any]) -> str:
     lines = [f"### 项目时间线：`{res['query']}`（匹配项目 {len(res['matched_projects'])} 个，共 {res['total_matches']} 条记录）"]
     if res["matched_projects"]:
@@ -1012,10 +1162,11 @@ def format_project_query_md(res: dict[str, Any]) -> str:
             lines.append(f"> 别名：{'、'.join(project['aliases'])}")
         if project.get("paths"):
             lines.append(f"> 关键路径：{' ； '.join(f'`{p}`' for p in project['paths'])}")
+    lines.extend(format_decisions_section(res.get("decisions") or [], res.get("superseded_decisions") or []))
     lines.extend(format_live_section(res.get("live") or []))
     lines.append("")
     if not res["entries"]:
-        if not res.get("live"):
+        if not res.get("live") and not res.get("decisions"):
             lines.append("_无匹配记录_")
         return "\n".join(lines)
     for e in res["entries"]:
@@ -1036,13 +1187,17 @@ def format_project_query_md(res: dict[str, Any]) -> str:
 
 
 def format_keyword_query_md(res: dict[str, Any]) -> str:
+    mode_tag = f" | {res['search_mode']}" if res.get("search_mode") else ""
     lines = [
-        f"### 关键词检索：`{res['query']}`（scope={res['scope']}，共 {res['total_matches']} 条，展示 {len(res['hits'])} 条）",
+        f"### 关键词检索：`{res['query']}`（scope={res['scope']}{mode_tag}，共 {res['total_matches']} 条，展示 {len(res['hits'])} 条）",
         "",
     ]
-    if not res["hits"] and not res.get("raw") and not res.get("live"):
+    if not res["hits"] and not res.get("raw") and not res.get("live") and not res.get("decisions"):
         lines.append("_无匹配结果_")
         return "\n".join(lines)
+    if res.get("decisions"):
+        lines.extend(format_decisions_section(res["decisions"]))
+        lines.append("")
     for h in res["hits"]:
         tag = "随想" if h["kind"] == "life_item" else ("当日主线" if h["kind"] == "day_headline" else h["scope"])
         mach = f" | @{h['machine']}" if h.get("machine") else ""
@@ -1244,6 +1399,31 @@ def main() -> None:
                            help="Record a real-time same-day note into the 0-token live WAL and refresh MEMORY_INDEX.md.")
     decisions.add_argument("--live-sync", action="store_true",
                            help="Run a 0-token incremental scan of today's 4 clients + Git and refresh MEMORY_INDEX.md.")
+    decisions.add_argument("--decision", nargs=2, metavar=("PROJECT", "TEXT"),
+                           help="Record a persistent project-scoped decision/constraint/pitfall.")
+    decisions.add_argument("--global-decision", metavar="TEXT",
+                           help="Record a persistent global cross-project constraint/pitfall.")
+    decisions.add_argument("--decisions", action="store_true",
+                           help="List long-term decisions/constraints (filter with --project/--scope/--kind/--keyword).")
+    decisions.add_argument("--supersede", nargs=2, metavar=("OLD_ID", "NEW_TEXT"),
+                           help="Supersede an existing decision with a new chain head.")
+    decisions.add_argument("--forget-decision", metavar="DEC_ID",
+                           help="Soft-delete (tombstone) a decision by ID.")
+    decisions.add_argument("--reindex", action="store_true",
+                           help="Force rebuild the derived SQLite FTS5 search index (structured + recent 30d sessions).")
+    decisions.add_argument("--doctor", action="store_true",
+                           help="Run full health & integrity diagnostics across hooks, JSON stores, FTS5, and NAS.")
+    parser.add_argument("--kind", choices=list(dec_mod.VALID_KINDS), default="decision",
+                        help="Kind for --decision/--global-decision (decision|constraint|pitfall).")
+    parser.add_argument("--tags", help="Comma-separated tags for --decision/--global-decision.")
+    parser.add_argument("--supersedes", nargs="+", metavar="OLD_ID",
+                        help="Old decision ID(s) superseded by a new --decision/--global-decision.")
+    parser.add_argument("--all-status", action="store_true",
+                        help="Include superseded/forgotten records when running --decisions.")
+    parser.add_argument("--exact", action="store_true",
+                        help="Bypass SQLite FTS5 ranking and use legacy strict substring AND matching.")
+    parser.add_argument("--fix", action="store_true",
+                        help="Apply safe, non-destructive repairs when running --doctor.")
     parser.add_argument("--note-path", nargs="+", metavar="PATH",
                         help="Optional path(s) to register alongside --note.")
     parser.add_argument("--keyword", "-k", help="Search keyword(s) (space-separated AND terms) across history.")
@@ -1296,6 +1476,194 @@ def main() -> None:
             )
         return
 
+    if args.doctor:
+        import doctor as doctor_mod
+
+        target_data_dir = args.data_dir or DEFAULT_DATA_DIR
+        report = doctor_mod.run_doctor(
+            target_data_dir,
+            cfg=cfg,
+            remote_config_path=args.remote_config,
+            fix=args.fix,
+            index_output=args.index_output,
+        )
+        if args.as_json:
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+        else:
+            print(doctor_mod.format_doctor_md(report))
+        return
+
+    if args.reindex:
+        target_data_dir = args.data_dir or DEFAULT_DATA_DIR
+        days = load_all_days(target_data_dir)
+        catalog = ProjectCatalog(days, load_registry(target_data_dir))
+        s_res = search_fts.rebuild_structured_index(target_data_dir, days=days, catalog=catalog)
+        sess_res = search_fts.sync_sessions_to_fts(
+            target_data_dir,
+            days=30,
+            tz_name=str(cfg.get("timezone") or "Asia/Shanghai"),
+            day_start_hour=int(cfg.get("day_start_hour", 5)),
+            cfg=cfg,
+        )
+        out = {"structured": s_res, "sessions": sess_res}
+        if args.as_json:
+            print(json.dumps(out, ensure_ascii=False, indent=2))
+        else:
+            print(
+                f"Rebuilt FTS5 index {s_res['db_path']} (trigram={s_res['trigram_enabled']}): "
+                f"{s_res['structured_docs']} structured docs, "
+                f"{sess_res['updated_files']} session files ({sess_res['indexed_chunks']} chunks)"
+            )
+        return
+
+    if args.decision or args.global_decision or args.decisions or args.supersede or args.forget_decision:
+        use_remote_dec = (
+            not args.local
+            and args.data_dir is None
+            and (args.remote or rc.configured)
+        )
+        target_data_dir = args.data_dir or DEFAULT_DATA_DIR
+        tz_name = str(cfg.get("timezone") or "Asia/Shanghai")
+        try:
+            if args.decisions:
+                if use_remote_dec:
+                    res, _ = remote_client.list_remote_decisions(
+                        rc,
+                        project=args.project,
+                        scope=None if args.scope in ("all", "work", "personal", "life") else args.scope,
+                        kind=args.kind if "--kind" in sys.argv else None,
+                        include_inactive=args.all_status,
+                        keyword=args.keyword,
+                        limit=args.limit,
+                    )
+                    items = res.get("decisions") or []
+                else:
+                    days = load_all_days(target_data_dir)
+                    catalog = ProjectCatalog(days, load_registry(target_data_dir))
+                    items = dec_mod.query_decisions(
+                        target_data_dir,
+                        project=args.project,
+                        kind=args.kind if "--kind" in sys.argv else None,
+                        include_inactive=args.all_status,
+                        keyword=args.keyword,
+                        limit=args.limit,
+                        catalog=catalog,
+                    )
+                if args.as_json:
+                    print(json.dumps({"total": len(items), "decisions": items}, ensure_ascii=False, indent=2))
+                else:
+                    print(dec_mod.format_decisions_md(items))
+                return
+
+            if args.decision or args.global_decision:
+                is_global = bool(args.global_decision)
+                proj_arg = "" if is_global else args.decision[0]
+                text_arg = args.global_decision if is_global else args.decision[1]
+                if use_remote_dec:
+                    res, _ = remote_client.mutate_remote_decision(
+                        rc,
+                        {
+                            "action": "add",
+                            "scope": "global" if is_global else "project",
+                            "project": proj_arg,
+                            "kind": args.kind,
+                            "text": text_arg,
+                            "tags": args.tags,
+                            "supersedes": args.supersedes or [],
+                        },
+                    )
+                    saved_dec = res["decision"]
+                else:
+                    days = load_all_days(target_data_dir)
+                    saved_dec = dec_mod.add_decision(
+                        target_data_dir,
+                        days,
+                        text=text_arg,
+                        scope="global" if is_global else "project",
+                        project=proj_arg,
+                        kind=args.kind,
+                        tags=args.tags,
+                        supersedes=args.supersedes,
+                        tz_name=tz_name,
+                        cfg=cfg,
+                    )
+                    generate_memory_index(
+                        days,
+                        output_path=args.index_output or resolve_index_path(cfg),
+                        tz_name=tz_name,
+                        catalog=ProjectCatalog(days, load_registry(target_data_dir)),
+                        data_dir=target_data_dir,
+                    )
+                if args.as_json:
+                    print(json.dumps(saved_dec, ensure_ascii=False, indent=2))
+                else:
+                    print(f"已写入决策 `{saved_dec['id']}` [{saved_dec['kind']}]: {saved_dec['text']}")
+                return
+
+            if args.supersede:
+                old_id, new_text = args.supersede
+                if use_remote_dec:
+                    res, _ = remote_client.mutate_remote_decision(
+                        rc,
+                        {
+                            "action": "supersede",
+                            "old_id": old_id,
+                            "text": new_text,
+                            "kind": args.kind if "--kind" in sys.argv else None,
+                            "tags": args.tags,
+                        },
+                    )
+                    saved_dec = res["decision"]
+                else:
+                    days = load_all_days(target_data_dir)
+                    saved_dec = dec_mod.supersede_decision(
+                        target_data_dir,
+                        days,
+                        old_id,
+                        new_text,
+                        kind=args.kind if "--kind" in sys.argv else None,
+                        tags=args.tags,
+                        tz_name=tz_name,
+                        cfg=cfg,
+                    )
+                    generate_memory_index(
+                        days,
+                        output_path=args.index_output or resolve_index_path(cfg),
+                        tz_name=tz_name,
+                        catalog=ProjectCatalog(days, load_registry(target_data_dir)),
+                        data_dir=target_data_dir,
+                    )
+                if args.as_json:
+                    print(json.dumps(saved_dec, ensure_ascii=False, indent=2))
+                else:
+                    print(f"已淘汰 `{old_id}` -> 新决策 `{saved_dec['id']}`: {saved_dec['text']}")
+                return
+
+            if args.forget_decision:
+                if use_remote_dec:
+                    res, _ = remote_client.mutate_remote_decision(
+                        rc,
+                        {"action": "forget", "id": args.forget_decision},
+                    )
+                    saved_dec = res["decision"]
+                else:
+                    days = load_all_days(target_data_dir)
+                    saved_dec = dec_mod.forget_decision(target_data_dir, args.forget_decision, tz_name=tz_name)
+                    generate_memory_index(
+                        days,
+                        output_path=args.index_output or resolve_index_path(cfg),
+                        tz_name=tz_name,
+                        catalog=ProjectCatalog(days, load_registry(target_data_dir)),
+                        data_dir=target_data_dir,
+                    )
+                if args.as_json:
+                    print(json.dumps(saved_dec, ensure_ascii=False, indent=2))
+                else:
+                    print(f"已软删除决策 `{saved_dec['id']}`")
+                return
+        except (ValueError, RuntimeError, OSError) as exc:
+            parser.exit(2, f"ERROR: {exc}\n")
+
     if args.note:
         target_data_dir = args.data_dir or DEFAULT_DATA_DIR
         days = load_all_days(target_data_dir)
@@ -1317,11 +1685,24 @@ def main() -> None:
             catalog=ProjectCatalog(days, load_registry(target_data_dir)),
             data_dir=target_data_dir,
         )
+        remote_note_res = None
+        if not args.local and args.data_dir is None and rc.configured and rc.write_token:
+            try:
+                remote_note_res, _ = remote_client.add_remote_note(
+                    rc,
+                    args.note[0],
+                    saved["note"]["text"],
+                    paths=args.note_path,
+                    workday=saved["workday"],
+                )
+            except Exception:
+                remote_note_res = None
         if args.as_json:
-            print(json.dumps({"workday": saved["workday"], "note": saved["note"], "index": stats}, ensure_ascii=False, indent=2))
+            print(json.dumps({"workday": saved["workday"], "note": saved["note"], "index": stats, "remote": remote_note_res}, ensure_ascii=False, indent=2))
         else:
             n = saved["note"]
-            print(f"已记入今日实时动态 ({saved['workday']} {n['time']}) [{n['project']}]: {n['text']}")
+            remote_suffix = " (已同步 NAS)" if remote_note_res else ""
+            print(f"已记入今日实时动态 ({saved['workday']} {n['time']}) [{n['project']}]: {n['text']}{remote_suffix}")
             print(f"已刷新 {stats['path']} ({stats['bytes']} bytes)")
         return
 
@@ -1333,6 +1714,8 @@ def main() -> None:
             force_scan=True,
             rebuild_index=True,
             index_output=args.index_output,
+            push_remote=(not args.local and args.data_dir is None and rc.configured and bool(rc.write_token)),
+            remote_config_path=args.remote_config,
         )
         if args.as_json:
             print(json.dumps(res, ensure_ascii=False, indent=2))
@@ -1399,8 +1782,17 @@ def main() -> None:
 
     if args.index:
         archived = {str(d.get("workday", "")) for d in days}
-        live_days = live_memory.load_uncompacted_live(target_data_dir, archived_workdays=archived)
-        print(render_memory_index(days, tz_name=str(cfg.get("timezone") or "Asia/Shanghai"), catalog=catalog, live_days=live_days))
+        live_days = multi_machine.load_merged_live_days(target_data_dir, archived_workdays=archived)
+        active_decs = dec_mod.query_decisions(target_data_dir, limit=12)
+        print(
+            render_memory_index(
+                days,
+                tz_name=str(cfg.get("timezone") or "Asia/Shanghai"),
+                catalog=catalog,
+                live_days=live_days,
+                active_decisions=active_decs,
+            )
+        )
         return
 
     if args.rebuild_index:
@@ -1479,6 +1871,7 @@ def main() -> None:
             asc=args.asc,
             limit=args.limit,
             catalog=catalog,
+            use_fts=not args.exact,
         )
         if args.as_json:
             print(json.dumps(res, ensure_ascii=False, indent=2))

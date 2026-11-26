@@ -26,12 +26,16 @@ from zoneinfo import ZoneInfo
 
 from multi_machine import atomic_write_json, file_lock
 from project_identity import ProjectCatalog, edit_registry, load_registry, name_key
+import redact
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LIVE_DIRNAME = "live"
 LIVE_LOCK_FILE = ".live.lock"
 SCAN_STAMP_FILE = ".last_scan_ts"
+REMOTE_PUSH_STAMP_FILE = ".last_remote_push_ts"
 DEFAULT_DEBOUNCE_SECONDS = 12
+DEFAULT_REMOTE_PUSH_DEBOUNCE = 30
+TAIL_READ_MAX_BYTES = 65536
 NOISE_CODEX_TITLES = {"guardian review"}
 
 
@@ -210,6 +214,7 @@ def add_note(
     if not project_clean or not text_clean:
         raise ValueError("项目名称与笔记内容不能为空。")
     cfg = cfg if cfg is not None else _load_cfg()
+    text_clean = redact.redact_with_cfg(text_clean, cfg)
     tz_name = str(cfg.get("timezone") or "Asia/Shanghai")
     tz = ZoneInfo(tz_name)
     now = datetime.now(tz)
@@ -320,11 +325,241 @@ def _parse_workspace_uris(raw: str) -> str:
     return _shorten_home(raw.strip())
 
 
+def _read_tail_lines(path: str, max_bytes: int = TAIL_READ_MAX_BYTES) -> list[str]:
+    """Read up to max_bytes from the tail of a UTF-8 JSONL file in O(1) seek time."""
+    if not path or not os.path.isfile(path):
+        return []
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            if size > max_bytes:
+                fh.seek(size - max_bytes)
+                raw = fh.read()
+                nl = raw.find(b"\n")
+                if nl != -1:
+                    raw = raw[nl + 1 :]
+            else:
+                raw = fh.read()
+        return raw.decode("utf-8", errors="ignore").splitlines()
+    except OSError:
+        return []
+
+
+_PATH_ARG_KEYS = ("path", "Path", "file_path", "target_file", "TargetFile", "AbsolutePath", "filePath")
+
+
+def _extract_paths_from_obj(obj: Any, out: list[str], seen: set[str], limit: int = 5) -> None:
+    if len(out) >= limit:
+        return
+    if isinstance(obj, str):
+        s = obj.strip()
+        if s.startswith("{") and s.endswith("}"):
+            try:
+                obj = json.loads(s)
+            except Exception:
+                return
+        else:
+            return
+    if isinstance(obj, dict):
+        for k in _PATH_ARG_KEYS:
+            v = obj.get(k)
+            if isinstance(v, str) and v.strip():
+                cleaned_p = v.strip().strip("\"'`,;")
+                short = _shorten_home(cleaned_p)
+                if short and short not in seen:
+                    seen.add(short)
+                    out.append(short)
+                    if len(out) >= limit:
+                        return
+        for v in obj.values():
+            if isinstance(v, (dict, list)):
+                _extract_paths_from_obj(v, out, seen, limit)
+    elif isinstance(obj, list):
+        for item in obj:
+            if isinstance(item, (dict, list)):
+                _extract_paths_from_obj(item, out, seen, limit)
+
+
+def _first_meaningful_snippet(raw: str, limit: int = 160) -> str:
+    txt = re.sub(r"<system-reminder[^>]*>.*?</system-reminder>", "", str(raw or ""), flags=re.S)
+    txt = re.sub(r"```[\s\S]*?```", " ", txt)
+    for line in txt.splitlines():
+        s = line.strip().lstrip("#>-* ").strip()
+        s = s.replace("**", "").strip()
+        if len(s) >= 4:
+            return _clean_text(s, limit)
+    return _clean_text(txt.replace("**", ""), limit)
+
+
+def _extract_transcript_tail(client: str, path: str) -> dict[str, Any]:
+    """Extract 0-token high-density context from the tail of a session JSONL file."""
+    lines = _read_tail_lines(path)
+    if not lines:
+        return {"last_user_prompt": "", "last_assistant_summary": "", "touched_files": []}
+    last_user = ""
+    last_asst = ""
+    touched: list[str] = []
+    seen_paths: set[str] = set()
+    norm = client.lower()
+
+    for line in reversed(lines):
+        if not line.strip():
+            continue
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(ev, dict):
+            continue
+
+        if norm == "antigravity":
+            kind = ev.get("type")
+            if kind == "PLANNER_RESPONSE":
+                for call in ev.get("tool_calls") or []:
+                    if isinstance(call, dict):
+                        _extract_paths_from_obj(call.get("args"), touched, seen_paths)
+                if not last_asst:
+                    cand = _first_meaningful_snippet(str(ev.get("content") or ""), 160)
+                    if cand:
+                        last_asst = cand
+            elif (kind == "USER_INPUT" or ev.get("source") == "USER_EXPLICIT") and not last_user:
+                raw_u = str(ev.get("content") or "")
+                m = re.search(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", raw_u, flags=re.S)
+                if m:
+                    raw_u = m.group(1)
+                cand = _first_meaningful_snippet(raw_u, 140)
+                if cand:
+                    last_user = cand
+        elif norm == "codex":
+            if ev.get("type") == "response_item":
+                payload = ev.get("payload") or {}
+                if not isinstance(payload, dict):
+                    continue
+                pk = payload.get("type")
+                role = payload.get("role")
+                if pk in ("function_call", "custom_tool_call"):
+                    _extract_paths_from_obj(payload.get("arguments", payload.get("input")), touched, seen_paths)
+                elif pk == "message" and role in ("user", "assistant"):
+                    content = payload.get("content")
+                    txt = ""
+                    if isinstance(content, str):
+                        txt = content
+                    elif isinstance(content, list):
+                        txt = " ".join(
+                            str(p.get("text") or "")
+                            for p in content
+                            if isinstance(p, dict) and p.get("type") in ("input_text", "output_text", "text")
+                        )
+                    cand = _first_meaningful_snippet(txt, 160 if role == "assistant" else 140)
+                    if role == "assistant" and not last_asst and cand:
+                        last_asst = cand
+                    elif role == "user" and not last_user and cand:
+                        last_user = cand
+        elif norm == "claude":
+            if ev.get("isSidechain"):
+                continue
+            kind = ev.get("type")
+            if kind not in ("user", "assistant"):
+                continue
+            msg = ev.get("message")
+            content = msg.get("content") if isinstance(msg, dict) else ev.get("content")
+            txt_parts: list[str] = []
+            if isinstance(content, str):
+                txt_parts.append(content)
+            elif isinstance(content, list):
+                for b in content:
+                    if isinstance(b, dict):
+                        if b.get("type") == "text":
+                            txt_parts.append(str(b.get("text") or ""))
+                        elif b.get("type") == "tool_use":
+                            _extract_paths_from_obj(b.get("input"), touched, seen_paths)
+                    elif isinstance(b, str):
+                        txt_parts.append(b)
+            cand = _first_meaningful_snippet(" ".join(txt_parts), 160 if kind == "assistant" else 140)
+            if kind == "assistant" and not last_asst and cand:
+                last_asst = cand
+            elif kind == "user" and not last_user and cand:
+                last_user = cand
+        else:  # workbuddy
+            role = ev.get("role") or ev.get("type")
+            if role in ("function_call", "custom_tool_call", "tool_use"):
+                _extract_paths_from_obj(ev.get("arguments", ev.get("input")), touched, seen_paths)
+            elif role in ("user", "assistant"):
+                msg = ev.get("message")
+                content = msg.get("content") if isinstance(msg, dict) else ev.get("content")
+                txt = content if isinstance(content, str) else ""
+                if isinstance(content, list):
+                    txt = " ".join(str(b.get("text") or "") for b in content if isinstance(b, dict))
+                cand = _first_meaningful_snippet(txt, 160 if role == "assistant" else 140)
+                if role == "assistant" and not last_asst and cand:
+                    last_asst = cand
+                elif role == "user" and not last_user and cand:
+                    last_user = cand
+
+        if last_user and last_asst and len(touched) >= 3:
+            break
+
+    return {
+        "last_user_prompt": last_user,
+        "last_assistant_summary": last_asst,
+        "touched_files": touched[:5],
+    }
+
+
+def _choose_live_summary(title: str, explicit_summary: str, tail: dict[str, Any]) -> str:
+    norm_title = _clean_text(title, 80).lower()
+    asst = str(tail.get("last_assistant_summary") or "").strip()
+    user = str(tail.get("last_user_prompt") or "").strip()
+    touched = [os.path.basename(p.rstrip("/")) for p in (tail.get("touched_files") or []) if p]
+    file_suffix = f"（文件: {', '.join(touched[:3])}）" if touched else ""
+
+    primary = ""
+    if asst and asst.lower() != norm_title:
+        primary = asst
+    elif explicit_summary and _clean_text(explicit_summary, 80).lower() != norm_title:
+        primary = explicit_summary
+    elif user and user.lower() != norm_title:
+        primary = user
+    else:
+        primary = explicit_summary or asst or user
+
+    if not primary and file_suffix:
+        return _clean_text(file_suffix.strip("（）"), 160)
+    if file_suffix and primary and file_suffix not in primary:
+        return _clean_text(f"{primary} {file_suffix}", 180)
+    return _clean_text(primary, 180)
+
+
+def _find_antigravity_transcript(conv_id: str, brain_dir: str | None = None) -> str:
+    root = brain_dir or os.path.expanduser("~/.gemini/antigravity/brain")
+    logs = os.path.join(root, conv_id, ".system_generated", "logs")
+    for name in ("transcript.jsonl", "transcript_full.jsonl"):
+        p = os.path.join(logs, name)
+        if os.path.isfile(p):
+            return p
+    return ""
+
+
+def _find_codex_rollout(session_id: str, codex_home: str | None = None) -> str:
+    if not session_id:
+        return ""
+    root = codex_home or os.path.expanduser("~/.codex")
+    for pat in (
+        os.path.join(root, "sessions", "*", "*", "*", f"*{session_id}*.jsonl"),
+        os.path.join(root, "sessions", f"*{session_id}*.jsonl"),
+    ):
+        matches = sorted(glob.glob(pat), reverse=True)
+        if matches:
+            return matches[0]
+    return ""
+
+
 def scan_antigravity_today(
     start: datetime,
     end: datetime,
     tz: ZoneInfo,
     db_path: str | None = None,
+    brain_dir: str | None = None,
 ) -> list[dict[str, Any]]:
     path = db_path or os.path.expanduser("~/.gemini/antigravity/conversation_summaries.db")
     conn = _open_sqlite_readonly(path)
@@ -356,13 +591,20 @@ def scan_antigravity_today(
             title = _clean_text(row["title"] or "", 80)
             preview = _clean_text(row["preview"] or "", 140)
             ws = _parse_workspace_uris(str(row["workspace_uris"] or ""))
+            tpath = _find_antigravity_transcript(cid, brain_dir=brain_dir)
+            tail = _extract_transcript_tail("antigravity", tpath) if tpath else {"last_user_prompt": "", "last_assistant_summary": "", "touched_files": []}
+            final_title = title or preview[:50] or cid[:8]
+            summary = _choose_live_summary(final_title, preview, tail)
             out.append(
                 {
                     "key": f"antigravity:{cid}",
                     "tool": "Antigravity",
                     "id": cid,
-                    "title": title or preview[:50] or cid[:8],
-                    "summary": preview,
+                    "title": final_title,
+                    "summary": summary,
+                    "last_user_prompt": tail["last_user_prompt"],
+                    "last_assistant_summary": tail["last_assistant_summary"],
+                    "touched_files": tail["touched_files"],
                     "workspace": ws,
                     "updated_at": local_dt.isoformat(timespec="seconds"),
                     "time": local_dt.strftime("%H:%M"),
@@ -506,13 +748,20 @@ def scan_codex_today(
         title = str(info.get("title") or "").strip()
         if not title or title.lower() in NOISE_CODEX_TITLES:
             continue
+        rpath = _find_codex_rollout(sid, codex_home=root)
+        tail = _extract_transcript_tail("codex", rpath) if rpath else {"last_user_prompt": "", "last_assistant_summary": "", "touched_files": []}
+        final_title = _clean_text(title, 80)
+        summary = _choose_live_summary(final_title, "", tail)
         out.append(
             {
                 "key": f"codex:{sid}",
                 "tool": "Codex",
                 "id": sid,
-                "title": _clean_text(title, 80),
-                "summary": "",
+                "title": final_title,
+                "summary": summary,
+                "last_user_prompt": tail["last_user_prompt"],
+                "last_assistant_summary": tail["last_assistant_summary"],
+                "touched_files": tail["touched_files"],
                 "workspace": "",
                 "updated_at": local_dt.isoformat(timespec="seconds"),
                 "time": local_dt.strftime("%H:%M"),
@@ -545,31 +794,19 @@ def scan_workbuddy_today(
             continue
         sid = os.path.splitext(os.path.basename(fp))[0]
         proj_slug = os.path.basename(os.path.dirname(fp))
-        last_user = ""
-        try:
-            with open(fp, "r", encoding="utf-8", errors="ignore") as fh:
-                lines = fh.readlines()[-60:]
-            for line in reversed(lines):
-                try:
-                    obj = json.loads(line)
-                except Exception:
-                    continue
-                if obj.get("type") == "user" or obj.get("role") == "user":
-                    content = obj.get("message", {}).get("content") if isinstance(obj.get("message"), dict) else obj.get("content")
-                    if isinstance(content, str) and content.strip():
-                        txt = re.sub(r"<system-reminder[^>]*>.*?</system-reminder>", "", content, flags=re.S).strip()
-                        if txt:
-                            last_user = _clean_text(txt, 140)
-                            break
-        except OSError:
-            pass
+        tail = _extract_transcript_tail("workbuddy", fp)
+        final_title = _clean_text(tail["last_user_prompt"] or proj_slug, 80)
+        summary = _choose_live_summary(final_title, tail["last_user_prompt"], tail)
         out.append(
             {
                 "key": f"workbuddy:{sid}",
                 "tool": "WorkBuddy",
                 "id": sid,
-                "title": _clean_text(last_user or proj_slug, 80),
-                "summary": last_user,
+                "title": final_title,
+                "summary": summary,
+                "last_user_prompt": tail["last_user_prompt"],
+                "last_assistant_summary": tail["last_assistant_summary"],
+                "touched_files": tail["touched_files"],
                 "workspace": proj_slug,
                 "updated_at": local_dt.isoformat(timespec="seconds"),
                 "time": local_dt.strftime("%H:%M"),
@@ -658,9 +895,10 @@ def scan_claude_today(
             continue
         sid = os.path.splitext(os.path.basename(fp))[0]
         meta = _read_claude_session_meta(fp)
+        tail = _extract_transcript_tail("claude", fp)
         ws = meta["cwd"]
-        summary = meta["last_prompt"]
-        title = meta["title"] or _clean_text(summary[:50], 80) or _clean_text(os.path.basename(ws.rstrip("/")), 80) or sid[:8]
+        title = meta["title"] or _clean_text((meta["last_prompt"] or tail["last_user_prompt"])[:50], 80) or _clean_text(os.path.basename(ws.rstrip("/")), 80) or sid[:8]
+        summary = _choose_live_summary(title, meta["last_prompt"], tail)
         out.append(
             {
                 "key": f"claude:{sid}",
@@ -668,6 +906,9 @@ def scan_claude_today(
                 "id": sid,
                 "title": title,
                 "summary": summary,
+                "last_user_prompt": tail["last_user_prompt"] or meta["last_prompt"],
+                "last_assistant_summary": tail["last_assistant_summary"],
+                "touched_files": tail["touched_files"],
                 "workspace": ws,
                 "updated_at": local_dt.isoformat(timespec="seconds"),
                 "time": local_dt.strftime("%H:%M"),
@@ -793,15 +1034,20 @@ def _extract_hook_session(
             ws = _parse_workspace_uris(str(db_row.get("workspace_uris") or ""))
 
         last_in = _clean_text(payload.get("lastUserInput") or "", 140)
+        tpath = _find_antigravity_transcript(cid)
+        tail = _extract_transcript_tail("antigravity", tpath) if tpath else {"last_user_prompt": "", "last_assistant_summary": "", "touched_files": []}
         title = _clean_text(ls_title or (db_row.get("title") if db_row else "") or last_in[:50] or cid[:8], 80)
-        summary = _clean_text(ls_summary or (db_row.get("preview") if db_row else "") or last_in, 140)
+        summary = _choose_live_summary(title, ls_summary or (db_row.get("preview") if db_row else "") or last_in, tail)
         return {
             "key": f"antigravity:{cid}",
             "tool": "Antigravity",
             "id": cid,
             "title": title,
             "summary": summary,
-            "last_input": last_in,
+            "last_input": last_in or tail["last_user_prompt"],
+            "last_user_prompt": tail["last_user_prompt"] or last_in,
+            "last_assistant_summary": tail["last_assistant_summary"],
+            "touched_files": tail["touched_files"],
             "workspace": ws,
             "updated_at": now.isoformat(timespec="seconds"),
             "time": now.strftime("%H:%M"),
@@ -866,6 +1112,52 @@ def _extract_hook_session(
     return None
 
 
+def _try_push_live_remote(
+    data_dir: str,
+    day: dict[str, Any],
+    *,
+    cfg: dict[str, Any] | None = None,
+    remote_config_path: str | None = None,
+    debounce_seconds: int = DEFAULT_REMOTE_PUSH_DEBOUNCE,
+    force: bool = False,
+) -> dict[str, Any] | None:
+    """Best-effort, debounced remote push of same-day live WAL to NAS hub."""
+    try:
+        import remote_client
+
+        rc = remote_client.load_remote_config(remote_config_path, project_cfg=cfg)
+        if not rc.configured or not rc.write_token:
+            return None
+        stamp = os.path.join(data_dir, LIVE_DIRNAME, REMOTE_PUSH_STAMP_FILE)
+        if not force and os.path.exists(stamp):
+            try:
+                last_ts = float(open(stamp, "r", encoding="utf-8").read().strip() or "0")
+                if time.time() - last_ts < debounce_seconds:
+                    return None
+            except Exception:
+                pass
+        short_eps = [
+            remote_client.Endpoint(name=ep.name, url=ep.url, timeout=min(ep.timeout, 2.5))
+            for ep in rc.endpoints
+        ]
+        short_rc = remote_client.RemoteConfig(
+            endpoints=short_eps,
+            read_token=rc.read_token,
+            write_token=rc.write_token,
+            machine_id=rc.machine_id,
+            cache_dir=rc.cache_dir,
+        )
+        res, ep = remote_client.push_live(short_rc, day, machine_id=rc.machine_id)
+        try:
+            with open(stamp, "w", encoding="utf-8") as fh:
+                fh.write(f"{time.time():.3f}")
+        except OSError:
+            pass
+        return {"endpoint": ep.name, **res}
+    except Exception:
+        return None
+
+
 def sync_live(
     data_dir: str,
     *,
@@ -881,6 +1173,8 @@ def sync_live(
     codex_home: str | None = None,
     claude_dir: str | None = None,
     workbuddy_dir: str | None = None,
+    push_remote: bool = False,
+    remote_config_path: str | None = None,
 ) -> dict[str, Any]:
     cfg = cfg if cfg is not None else _load_cfg()
     tz_name = str(cfg.get("timezone") or "Asia/Shanghai")
@@ -943,8 +1237,9 @@ def sync_live(
             except OSError:
                 pass
 
-        day["sessions"] = sessions
-        day["git"] = git_items
+        day["sessions"] = redact.redact_with_cfg(sessions, cfg)
+        day["git"] = redact.redact_with_cfg(git_items, cfg)
+        day["notes"] = redact.redact_with_cfg(list(day.get("notes") or []), cfg)
         day["updated_at"] = now.isoformat(timespec="seconds")
         atomic_write_json(live_file_path(data_dir, wd), day)
 
@@ -962,6 +1257,24 @@ def sync_live(
             data_dir=data_dir,
         )
 
+    try:
+        import search_fts
+
+        if os.path.exists(search_fts.index_db_path(data_dir)):
+            search_fts.sync_live_to_fts(data_dir, day)
+    except Exception:
+        pass
+
+    remote_res = None
+    if push_remote:
+        remote_res = _try_push_live_remote(
+            data_dir,
+            day,
+            cfg=cfg,
+            remote_config_path=remote_config_path,
+            force=force_scan,
+        )
+
     return {
         "workday": wd,
         "scanned": scanned,
@@ -970,6 +1283,7 @@ def sync_live(
         "sessions_count": len(day["sessions"]),
         "git_count": len(day["git"]),
         "index": index_stats,
+        "remote_push": remote_res,
     }
 
 
@@ -1045,6 +1359,7 @@ def main() -> None:
     parser.add_argument("--force", action="store_true", help="Ignore debounce window and scan all 4 clients + git.")
     parser.add_argument("--no-rebuild-index", action="store_true", help="Do not rewrite MEMORY_INDEX.md.")
     parser.add_argument("--index-output", default=None, help="Override MEMORY_INDEX.md output path.")
+    parser.add_argument("--push-remote", action="store_true", help="Debounced push of live WAL to configured NAS hub.")
     parser.add_argument("--json", dest="as_json", action="store_true", help="Print JSON summary.")
     args = parser.parse_args()
 
@@ -1070,6 +1385,7 @@ def main() -> None:
         force_scan=args.force,
         rebuild_index=not args.no_rebuild_index,
         index_output=args.index_output,
+        push_remote=args.push_remote,
     )
     if args.as_json:
         print(json.dumps(res, ensure_ascii=False, indent=2))
