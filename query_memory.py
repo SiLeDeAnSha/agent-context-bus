@@ -1292,6 +1292,8 @@ def _run_remote_query(args: argparse.Namespace, rc: remote_client.RemoteConfig) 
         params["raw"] = "sources"
     if args.asc:
         params["asc"] = "1"
+    if args.exact:
+        params["exact"] = "1"
 
     if args.project:
         params["project"] = args.project

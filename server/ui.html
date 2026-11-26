@@ -53,6 +53,7 @@
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
   th { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); background: #fafaf8; }
+  .nowrap { white-space: nowrap; }
   code { font-family: var(--mono); font-size: 12px; background: #f1f1ed; padding: 1px 5px; }
   .badge { display: inline-block; font-size: 11px; font-family: var(--mono); padding: 2px 6px; border: 1px solid var(--border); }
   .badge.active { border-color: var(--ok); color: var(--ok); }
@@ -174,7 +175,7 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-const esc = (s) => String(s || "").replace(/[&<>"']/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
 
 function toast(msg) {
   const el = $("toast");
@@ -220,7 +221,7 @@ async function loadOverview() {
   }
   $("live-container").innerHTML = days.map((d) => {
     const notes = (d.notes || []).map((n) => `<li><code>${esc(n.time)}</code> <b>${esc(n.project)}</b>${n.machine ? ` <code>@${esc(n.machine)}</code>` : ""}: ${esc(n.text)}</li>`).join("");
-    const sess = (d.sessions || []).map((s) => `<tr><td><code>${esc(s.time)}</code></td><td>${esc(s.tool)}${s.machine ? ` <code>@${esc(s.machine)}</code>` : ""}</td><td>${esc(s.title)}</td><td>${esc(s.summary || s.last_input || "-")}</td></tr>`).join("");
+    const sess = (d.sessions || []).map((s) => `<tr><td class="nowrap"><code>${esc(s.time)}</code></td><td class="nowrap">${esc(s.tool)}${s.machine ? ` <code>@${esc(s.machine)}</code>` : ""}</td><td>${esc(s.title)}</td><td>${esc(s.summary || s.last_input || "-")}</td></tr>`).join("");
     return `<h3>${esc(d.workday)} <span class="muted">刷新 ${esc((d.updated_at || "").slice(11, 16))}</span></h3>`
       + (notes ? `<ul>${notes}</ul>` : "")
       + (sess ? `<table><thead><tr><th>时间</th><th>客户端</th><th>标题</th><th>最新动态</th></tr></thead><tbody>${sess}</tbody></table>` : "");
@@ -234,7 +235,7 @@ async function runSearch() {
   if ($("q-machine").value.trim()) qs.set("machine", $("q-machine").value.trim());
   const res = await api("/api/v1/query?" + qs.toString());
   const decs = (res.decisions || []).map((d) => `<div style="margin-bottom:8px"><span class="badge constraint">${esc(d.kind)}</span> <b>${esc(d.project || "全局")}</b>: ${esc(d.text)}</div>`).join("");
-  const rows = (res.hits || []).map((h) => `<tr><td><code>${esc(h.workday)}</code></td><td>${esc(h.tool)}${h.machine ? ` @${esc(h.machine)}` : ""}</td><td><b>${esc(h.project)}</b></td><td>${esc(h.summary)}</td></tr>`).join("");
+  const rows = (res.hits || []).map((h) => `<tr><td class="nowrap"><code>${esc(h.workday)}</code></td><td class="nowrap">${esc(h.tool)}${h.machine ? ` @${esc(h.machine)}` : ""}</td><td><b>${esc(h.project)}</b></td><td>${esc(h.summary)}</td></tr>`).join("");
   $("search-results").innerHTML = (decs ? `<div class="panel" style="background:#fafaf8">${decs}</div>` : "")
     + (rows ? `<table><thead><tr><th>日期</th><th>工具</th><th>项目</th><th>摘要</th></tr></thead><tbody>${rows}</tbody></table>` : "<p class='muted'>无匹配结果。</p>");
 }

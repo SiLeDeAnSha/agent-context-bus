@@ -473,21 +473,28 @@ def save_machine_summary(data_dir: str, machine_id: str, summary_payload: dict[s
 
 
 def list_machines(data_dir: str) -> list[dict[str, Any]]:
-    """Summarize all machines that have uploaded raw or summary shards."""
+    """Summarize all machines that have uploaded raw, summary, or live WAL shards."""
     machines_root = os.path.join(data_dir, "machines")
-    if not os.path.isdir(machines_root):
-        return []
+    live_root = os.path.join(data_dir, "live", "machines")
+    names: set[str] = set()
+    for root in (machines_root, live_root):
+        if not os.path.isdir(root):
+            continue
+        for name in os.listdir(root):
+            if name.startswith(".") or name in ("__nas__", "__merged__"):
+                continue
+            if os.path.isdir(os.path.join(root, name)):
+                names.add(name)
     out: list[dict[str, Any]] = []
-    for name in sorted(os.listdir(machines_root)):
-        if name.startswith(".") or name in ("__nas__", "__merged__"):
-            continue
+    for name in sorted(names):
         mdir = os.path.join(machines_root, name)
-        if not os.path.isdir(mdir):
-            continue
-        raw_files = sorted(glob.glob(os.path.join(mdir, "raw", "*", "raw_*.json")))
-        sum_files = sorted(glob.glob(os.path.join(mdir, "summary", "*", "summary_*.json")))
+        ldir = os.path.join(live_root, name)
+        raw_files = sorted(glob.glob(os.path.join(mdir, "raw", "*", "raw_*.json"))) if os.path.isdir(mdir) else []
+        sum_files = sorted(glob.glob(os.path.join(mdir, "summary", "*", "summary_*.json"))) if os.path.isdir(mdir) else []
+        live_files = sorted(glob.glob(os.path.join(ldir, "live_*.json"))) if os.path.isdir(ldir) else []
         raw_dates = [os.path.basename(p)[4:-5] for p in raw_files]
         sum_dates = [os.path.basename(p)[8:-5] for p in sum_files]
+        live_dates = [os.path.basename(p)[5:-5] for p in live_files]
         out.append(
             {
                 "machine_id": name,
@@ -495,6 +502,8 @@ def list_machines(data_dir: str) -> list[dict[str, Any]]:
                 "latest_raw_date": raw_dates[-1] if raw_dates else "",
                 "summary_days": len(sum_dates),
                 "latest_summary_date": sum_dates[-1] if sum_dates else "",
+                "live_days": len(live_dates),
+                "latest_live_date": live_dates[-1] if live_dates else "",
             }
         )
     return out

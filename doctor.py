@@ -49,29 +49,43 @@ def _check_sqlite_fts() -> dict[str, Any]:
 
 
 def _check_global_rules_and_hooks(data_dir: str) -> dict[str, Any]:
-    targets = {
+    targets: dict[str, str | list[str]] = {
         "antigravity_rule": os.path.expanduser("~/.gemini/GEMINI.md"),
         "codex_rule": os.path.expanduser("~/.codex/AGENTS.md"),
         "claude_rule": os.path.expanduser("~/.claude/CLAUDE.md"),
         "workbuddy_rule": os.path.expanduser("~/.workbuddy/USER.md"),
-        "antigravity_hooks": os.path.expanduser("~/.gemini/antigravity/hooks.json"),
+        "antigravity_hooks": [
+            os.path.expanduser("~/.gemini/config/hooks.json"),
+            os.path.expanduser("~/.gemini/antigravity/hooks.json"),
+        ],
         "codex_hooks": os.path.expanduser("~/.codex/hooks.json"),
         "claude_settings": os.path.expanduser("~/.claude/settings.json"),
     }
     status: dict[str, str] = {}
-    for name, path in targets.items():
-        if not os.path.exists(path):
+    for name, raw_paths in targets.items():
+        candidates = raw_paths if isinstance(raw_paths, list) else [raw_paths]
+        existing = [p for p in candidates if os.path.exists(p)]
+        if not existing:
             status[name] = "missing"
             continue
-        try:
-            with open(path, "r", encoding="utf-8", errors="ignore") as fh:
-                content = fh.read()
-            if name.endswith("_rule"):
-                status[name] = "synced" if "DAILY-SUMMARY START" in content else "unsynced"
-            else:
-                status[name] = "hooked" if "hook_bridge.py" in content else "no_hook"
-        except OSError:
-            status[name] = "unreadable"
+        state_val = "unsynced" if name.endswith("_rule") else "no_hook"
+        readable_any = False
+        for path in existing:
+            try:
+                with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+                    content = fh.read()
+                readable_any = True
+                if name.endswith("_rule"):
+                    if "DAILY-SUMMARY START" in content:
+                        state_val = "synced"
+                        break
+                else:
+                    if "hook_bridge.py" in content:
+                        state_val = "hooked"
+                        break
+            except OSError:
+                continue
+        status[name] = state_val if readable_any else "unreadable"
 
     err_log = os.path.join(data_dir, "live", "hook_errors.log")
     recent_errors: list[str] = []

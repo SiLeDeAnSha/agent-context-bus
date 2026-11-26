@@ -491,6 +491,7 @@ def _execute_query(state: HubState, args: dict[str, Any]) -> tuple[str, Any]:
             asc=asc,
             limit=limit,
             catalog=catalog,
+            use_fts=not bool(args.get("exact")),
         )
         return query_memory.format_keyword_query_md(res), res
     res = query_memory.query_projects(
@@ -789,6 +790,7 @@ def make_handler(state: HubState) -> type[BaseHTTPRequestHandler]:
                     "machine": qs.get("machine"),
                     "raw": qs.get("raw", "").lower() in ("1", "true", "yes", "sources"),
                     "asc": qs.get("asc", "").lower() in ("1", "true", "yes"),
+                    "exact": qs.get("exact", "").lower() in ("1", "true", "yes"),
                     "limit": qs.get("limit") or 20,
                 }
                 md, data = _execute_query(state, args)

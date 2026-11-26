@@ -245,6 +245,10 @@ def supersede_decision(
     old = next((d for d in store["decisions"] if str(d.get("id")) == str(old_id).strip()), None)
     if old is None:
         raise ValueError(f"找不到决策 ID: {old_id}")
+    old_status = str(old.get("status") or "active")
+    if old_status != "active":
+        hint = f"，当前接任版本为 `{old.get('superseded_by')}`" if old_status == "superseded" and old.get("superseded_by") else ""
+        raise ValueError(f"决策 `{old['id']}` 状态为 `{old_status}`，不能重复替代{hint}")
     merged_tags = _clean_tags(tags) if tags is not None else list(old.get("tags") or [])
     return add_decision(
         data_dir,

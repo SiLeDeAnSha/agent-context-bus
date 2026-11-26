@@ -137,6 +137,8 @@ class V05UpgradeTests(unittest.TestCase):
                 "新方案：仅高优先级域名走住宅代理，避免污染全局 TUN",
             )
             self.assertEqual(d2["supersedes"], [d1["id"]])
+            with self.assertRaises(ValueError):
+                decisions.supersede_decision(tmp, days, d1["id"], "重复替代已淘汰决策应被拒绝")
 
             active = decisions.query_decisions(tmp, project="四端代理规则优化")
             self.assertEqual([d["id"] for d in active], [d2["id"]])
@@ -281,6 +283,14 @@ class V05UpgradeTests(unittest.TestCase):
                 self.assertEqual(sorted(merged_day["machines"]), ["macbook-pro", "win-desktop"])
                 self.assertIn("[REDACTED:API_KEY]", merged_day["notes"][0]["text"])
 
+                status_resp, _ = remote_client.request_json(rc_write, "GET", "/api/v1/status")
+                self.assertEqual(sorted(m["machine_id"] for m in status_resp["machines"]), ["macbook-pro", "win-desktop"])
+
+                exact_resp, _ = remote_client.request_json(
+                    rc_write, "GET", "/api/v1/query", params={"keyword": "FTS5", "exact": "1", "format": "json"}
+                )
+                self.assertEqual(exact_resp["search_mode"], "exact")
+
                 idx_md, _ = remote_client.request_text(rc_write, "GET", "/api/v1/index")
                 self.assertIn("完成 FTS5 压测", idx_md)
                 self.assertIn("Windows端 llama.cpp 编译通过", idx_md)
@@ -337,6 +347,7 @@ class V05UpgradeTests(unittest.TestCase):
                     self.assertEqual(resp.headers.get("X-Content-Type-Options"), "nosniff")
                     html = resp.read().decode("utf-8")
                     self.assertIn("AGENT CONTEXT BUS", html)
+                    self.assertIn('String(s ?? "")', html)
 
                 with self.assertRaises(urlerror.HTTPError) as ctx:
                     urlrequest.urlopen(f"{base_url}/api/v1/live", timeout=3.0)
