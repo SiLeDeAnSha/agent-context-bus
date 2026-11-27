@@ -1665,6 +1665,45 @@ def find_missing_workdays(cfg: dict[str, Any], end_workday: str, lookback_days: 
     return missing
 
 
+def _pushed_state_path(cache_dir: str) -> str:
+    return os.path.join(os.path.expanduser(cache_dir), "pushed_workdays.json")
+
+
+def load_pushed_workdays(cache_dir: str, machine_id: str) -> set[str]:
+    path = _pushed_state_path(cache_dir)
+    if not os.path.exists(path):
+        return set()
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        bucket = data.get(machine_id) if isinstance(data, dict) else {}
+        return set(bucket.keys()) if isinstance(bucket, dict) else set()
+    except (OSError, json.JSONDecodeError):
+        return set()
+
+
+def record_pushed_workday(cache_dir: str, machine_id: str, workday: str, counts: dict[str, Any]) -> None:
+    path = _pushed_state_path(cache_dir)
+    data: dict[str, Any] = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                data = loaded
+        except (OSError, json.JSONDecodeError):
+            data = {}
+    bucket = data.setdefault(machine_id, {})
+    if not isinstance(bucket, dict):
+        bucket = {}
+        data[machine_id] = bucket
+    bucket[workday] = {
+        "pushed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "counts": counts,
+    }
+    multi_machine.atomic_write_json(path, data)
+
+
 def main() -> None:
     cfg = load_config()
     parser = argparse.ArgumentParser(description="Collect daily activity traces.")
@@ -1676,6 +1715,7 @@ def main() -> None:
     parser.add_argument("--all-history", action="store_true", help="Single-pass extract all historical AG/Codex days through end workday.")
     parser.add_argument("--machine", help="Machine identifier for multi-device sharding (default: env/config/hostname).")
     parser.add_argument("--push", action="store_true", help="Push collected raw payload(s) to the configured remote NAS hub.")
+    parser.add_argument("--skip-pushed", action="store_true", help="Skip completed workdays already pushed by this machine (for idempotent catchup schedules).")
     parser.add_argument("--remote-config", help="Path to remote.json override when using --push.")
     args = parser.parse_args()
 
@@ -1710,6 +1750,14 @@ def main() -> None:
         end_d = datetime.strptime(end_workday, "%Y-%m-%d").date()
         dates = [(end_d - timedelta(days=offset)).strftime("%Y-%m-%d") for offset in range(days - 1, -1, -1)]
 
+    if args.push and args.skip_pushed and rc is not None:
+        already_pushed = load_pushed_workdays(rc.cache_dir, machine_id)
+        pending_dates = [d for d in dates if d >= cur_wd or d not in already_pushed]
+        if not pending_dates:
+            print("ALREADY_PUSHED:" + ",".join(dates))
+            return
+        dates = pending_dates
+
     if not dates:
         print("NO_MISSING")
         return
@@ -1721,7 +1769,11 @@ def main() -> None:
         push_part = ""
         if args.push and rc is not None:
             res, ep = remote_client.push_raw(rc, p, machine_id=machine_id)
+            if d < cur_wd:
+                record_pushed_workday(rc.cache_dir, machine_id, d, c)
             push_part = f" | PUSHED->{ep.name} (machines={','.join(res.get('machines', []))})"
+            if res.get("auto_resummarize_queued"):
+                push_part += " [auto-resummarize queued]"
         print(
             f"{d} ({p['weekday']}) [{machine_id}]: AG={c['antigravity_sessions']}, Codex={c['codex_sessions']}, "
             f"Claude={c.get('claude_sessions', 0)}, WB={c.get('workbuddy_sessions', 0)}, Git={c['git_repos']}, Files={c['file_groups']}, "

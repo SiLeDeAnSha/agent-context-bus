@@ -387,6 +387,86 @@ class V05UpgradeTests(unittest.TestCase):
             self.assertTrue(os.path.exists(idx_out))
             self.assertTrue(os.path.exists(search_fts.index_db_path(data_dir)))
 
+    def test_late_raw_push_debounce_resummarize_and_skip_pushed(self) -> None:
+        import collect
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # 1. Idempotent pushed workday persistence
+            self.assertEqual(collect.load_pushed_workdays(tmp, "macbook-neo"), set())
+            collect.record_pushed_workday(tmp, "macbook-neo", "2026-11-26", {"antigravity_sessions": 3})
+            self.assertEqual(collect.load_pushed_workdays(tmp, "macbook-neo"), {"2026-11-26"})
+            self.assertEqual(collect.load_pushed_workdays(tmp, "win-desktop"), set())
+
+            # 2. Server debounces late raw pushes from multiple machines and ignores active workday
+            state = hub_app.HubState(
+                storage_root=tmp,
+                read_token="r-tok",
+                write_token="w-tok",
+                enable_auto_summarize=True,
+                allow_fallback_summarize=True,
+                push_resummarize_debounce_sec=0.15,
+            )
+            calls: list[list[str]] = []
+            fired = threading.Event()
+
+            def fake_summarize(workdays=None, *, allow_fallback=None):
+                calls.append(list(workdays or []))
+                fired.set()
+                return {"status": "ok", "workdays": list(workdays or [])}
+
+            state.run_summarize = fake_summarize  # type: ignore[method-assign]
+            server = hub_app.create_server("127.0.0.1", 0, state)
+            port = server.server_address[1]
+            t = threading.Thread(target=server.serve_forever, daemon=True)
+            t.start()
+            base_url = f"http://127.0.0.1:{port}"
+            try:
+                rc = remote_client.RemoteConfig(
+                    endpoints=[remote_client.Endpoint("local", base_url, timeout=3.0)],
+                    read_token="r-tok",
+                    write_token="w-tok",
+                    machine_id="macbook-neo",
+                    cache_dir=os.path.join(tmp, "cache"),
+                )
+                cur_wd = live_memory.resolve_workday({"timezone": "Asia/Shanghai", "day_start_hour": 5})
+
+                # Pushing active workday must NOT queue premature compaction
+                res_today, _ = remote_client.push_raw(
+                    rc,
+                    {"workday": cur_wd, "weekday": "今天", "counts": {}, "antigravity": [], "codex": [], "git": [], "files": []},
+                    machine_id="macbook-neo",
+                )
+                self.assertFalse(res_today["auto_resummarize_queued"])
+
+                # Pushing a completed historical workday from two machines coalesces into 1 debounced run
+                for mid in ("macbook-neo", "win-desktop"):
+                    res_past, _ = remote_client.push_raw(
+                        rc,
+                        {
+                            "workday": "2026-11-20",
+                            "weekday": "周五",
+                            "counts": {},
+                            "antigravity": [{"id": f"s-{mid}", "title": "late", "user_prompts": ["key=sk-proj-1234567890abcdefghijklmnop"]}],
+                            "codex": [],
+                            "git": [],
+                            "files": [],
+                        },
+                        machine_id=mid,
+                    )
+                    self.assertTrue(res_past["auto_resummarize_queued"])
+
+                self.assertTrue(fired.wait(timeout=2.0))
+                self.assertEqual(calls, [["2026-11-20"]])
+
+                # Verify server-side redaction on ingested raw payload
+                merged_raw = query_memory.load_raw_day("2026-11-20", data_dir=state.data_dir)
+                self.assertIsNotNone(merged_raw)
+                self.assertIn("[REDACTED:API_KEY]", json.dumps(merged_raw, ensure_ascii=False))
+            finally:
+                state.stop_scheduler()
+                server.shutdown()
+                server.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

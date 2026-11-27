@@ -37,7 +37,7 @@ RUNNER="${HOME}/.daily-memory/run_collector.sh"
 cat > "${RUNNER}" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-"${PYTHON_BIN}" "${PROJECT_DIR}/collect.py" --yesterday --missing --machine "${MACHINE_ID}" --push --remote-config "${REMOTE_CFG}"
+"${PYTHON_BIN}" "${PROJECT_DIR}/collect.py" --yesterday --missing --skip-pushed --machine "${MACHINE_ID}" --push --remote-config "${REMOTE_CFG}"
 "${PYTHON_BIN}" "${PROJECT_DIR}/query_memory.py" --sync-cache --remote-config "${REMOTE_CFG}"
 EOF
 chmod +x "${RUNNER}"
@@ -55,12 +55,32 @@ cat > "${PLIST_PATH}" <<EOF
     <string>${RUNNER}</string>
   </array>
   <key>StartCalendarInterval</key>
-  <dict>
-    <key>Hour</key>
-    <integer>${HOUR}</integer>
-    <key>Minute</key>
-    <integer>${MINUTE}</integer>
-  </dict>
+  <array>
+    <dict>
+      <key>Hour</key>
+      <integer>${HOUR}</integer>
+      <key>Minute</key>
+      <integer>${MINUTE}</integer>
+    </dict>
+    <dict>
+      <key>Hour</key>
+      <integer>10</integer>
+      <key>Minute</key>
+      <integer>30</integer>
+    </dict>
+    <dict>
+      <key>Hour</key>
+      <integer>14</integer>
+      <key>Minute</key>
+      <integer>0</integer>
+    </dict>
+    <dict>
+      <key>Hour</key>
+      <integer>19</integer>
+      <key>Minute</key>
+      <integer>0</integer>
+    </dict>
+  </array>
   <key>RunAtLoad</key>
   <false/>
   <key>StandardOutPath</key>
@@ -73,5 +93,5 @@ EOF
 
 launchctl unload "${PLIST_PATH}" >/dev/null 2>&1 || true
 launchctl load "${PLIST_PATH}"
-echo "Installed LaunchAgent ${PLIST_PATH} (daily ${HOUR}:${MINUTE}, machine=${MACHINE_ID})."
+echo "Installed LaunchAgent ${PLIST_PATH} (primary ${HOUR}:${MINUTE} + catchup 10:30/14:00/19:00, machine=${MACHINE_ID})."
 echo "Test now with: bash '${RUNNER}'"

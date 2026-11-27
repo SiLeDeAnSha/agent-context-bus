@@ -207,6 +207,7 @@ class HubState:
         llm_api_key: str = "",
         llm_model: str = "gpt-4o-mini",
         allow_fallback_summarize: bool = False,
+        push_resummarize_debounce_sec: float = 120.0,
     ) -> None:
         self.storage_root = os.path.abspath(os.path.expanduser(storage_root))
         self.data_dir = os.path.join(self.storage_root, "data")
@@ -229,9 +230,14 @@ class HubState:
         self.llm_api_key = llm_api_key.strip()
         self.llm_model = llm_model.strip() or "gpt-4o-mini"
         self.allow_fallback_summarize = allow_fallback_summarize
+        self.push_resummarize_debounce_sec = max(0.0, float(push_resummarize_debounce_sec))
 
         self.last_summarize_run: dict[str, Any] = {}
         self._write_lock = threading.Lock()
+        self._summarize_lock = threading.Lock()
+        self._debounce_lock = threading.Lock()
+        self._pending_resummarize: set[str] = set()
+        self._debounce_timer: threading.Timer | None = None
         self._stop_event = threading.Event()
         self._scheduler_thread: threading.Thread | None = None
 
@@ -317,43 +323,92 @@ class HubState:
         *,
         allow_fallback: bool | None = None,
     ) -> dict[str, Any]:
-        fallback = self.allow_fallback_summarize if allow_fallback is None else allow_fallback
-        target_dates = workdays or summarizer.find_unsummarized_raw_days(
-            self.data_dir,
-            tz_name=self.timezone_name,
-            day_start_hour=self.day_start_hour,
-        )
-        if not target_dates:
-            res = {"status": "noop", "workdays": [], "ran_at": datetime.now(timezone.utc).isoformat()}
+        with self._summarize_lock:
+            fallback = self.allow_fallback_summarize if allow_fallback is None else allow_fallback
+            target_dates = workdays or summarizer.find_unsummarized_raw_days(
+                self.data_dir,
+                tz_name=self.timezone_name,
+                day_start_hour=self.day_start_hour,
+            )
+            if not target_dates:
+                res = {"status": "noop", "workdays": [], "ran_at": datetime.now(timezone.utc).isoformat()}
+                self.last_summarize_run = res
+                return res
+
+            generated: list[dict[str, Any]] = []
+            errors: list[dict[str, str]] = []
+            for wd in target_dates:
+                try:
+                    day_summary = summarizer.summarize_workday(
+                        wd,
+                        self.data_dir,
+                        llm_base_url=self.llm_base_url,
+                        llm_api_key=self.llm_api_key,
+                        llm_model=self.llm_model,
+                        allow_fallback=fallback,
+                    )
+                    generated.append(day_summary)
+                except Exception as exc:
+                    errors.append({"workday": wd, "error": str(exc)})
+
+            applied = self.apply_summaries("__nas__", generated) if generated else {}
+            res = {
+                "status": "ok" if not errors else ("partial" if generated else "error"),
+                "workdays": [d["workday"] for d in generated],
+                "errors": errors,
+                "applied": applied,
+                "ran_at": datetime.now(timezone.utc).isoformat(),
+            }
             self.last_summarize_run = res
             return res
 
-        generated: list[dict[str, Any]] = []
-        errors: list[dict[str, str]] = []
-        for wd in target_dates:
-            try:
-                day_summary = summarizer.summarize_workday(
-                    wd,
-                    self.data_dir,
-                    llm_base_url=self.llm_base_url,
-                    llm_api_key=self.llm_api_key,
-                    llm_model=self.llm_model,
-                    allow_fallback=fallback,
-                )
-                generated.append(day_summary)
-            except Exception as exc:
-                errors.append({"workday": wd, "error": str(exc)})
+    def schedule_resummarize_for_workday(self, workday: str) -> bool:
+        """Debounce auto-resummarize when a late device pushes a completed workday's raw shard."""
+        wd = str(workday or "").strip()
+        if (
+            not wd
+            or not self.enable_auto_summarize
+            or self.push_resummarize_debounce_sec <= 0
+            or self._stop_event.is_set()
+        ):
+            return False
+        if not (self.llm_base_url and self.llm_api_key) and not self.allow_fallback_summarize:
+            return False
+        cur_wd = live_memory.resolve_workday(
+            {"timezone": self.timezone_name, "day_start_hour": self.day_start_hour}
+        )
+        # Never auto-compact the still-active workday before day_start_hour rollover
+        if wd >= cur_wd:
+            return False
+        with self._debounce_lock:
+            self._pending_resummarize.add(wd)
+            if self._debounce_timer is not None:
+                self._debounce_timer.cancel()
+            timer = threading.Timer(self.push_resummarize_debounce_sec, self._flush_pending_resummarize)
+            timer.daemon = True
+            timer.name = "daily-memory-push-resummarize"
+            self._debounce_timer = timer
+            timer.start()
+        return True
 
-        applied = self.apply_summaries("__nas__", generated) if generated else {}
-        res = {
-            "status": "ok" if not errors else ("partial" if generated else "error"),
-            "workdays": [d["workday"] for d in generated],
-            "errors": errors,
-            "applied": applied,
-            "ran_at": datetime.now(timezone.utc).isoformat(),
-        }
-        self.last_summarize_run = res
-        return res
+    def _flush_pending_resummarize(self) -> None:
+        if self._stop_event.is_set():
+            return
+        with self._debounce_lock:
+            pending = sorted(self._pending_resummarize)
+            self._pending_resummarize.clear()
+            self._debounce_timer = None
+        if not pending:
+            return
+        try:
+            self.run_summarize(workdays=pending)
+        except Exception as exc:
+            self.last_summarize_run = {
+                "status": "error",
+                "workdays": pending,
+                "error": str(exc),
+                "ran_at": datetime.now(timezone.utc).isoformat(),
+            }
 
     def get_status(self) -> dict[str, Any]:
         days = query_memory.load_all_days(self.data_dir)
@@ -373,6 +428,8 @@ class HubState:
             "auto_summarize": {
                 "enabled": self.enable_auto_summarize,
                 "schedule": f"{self.summarize_hour:02d}:{self.summarize_minute:02d} ({self.timezone_name})",
+                "push_debounce_sec": self.push_resummarize_debounce_sec,
+                "pending_workdays": sorted(self._pending_resummarize),
                 "llm_configured": bool(self.llm_base_url and self.llm_api_key),
                 "llm_model": self.llm_model,
                 "last_run": self.last_summarize_run,
@@ -409,6 +466,11 @@ class HubState:
 
     def stop_scheduler(self) -> None:
         self._stop_event.set()
+        with self._debounce_lock:
+            if self._debounce_timer is not None:
+                self._debounce_timer.cancel()
+                self._debounce_timer = None
+            self._pending_resummarize.clear()
 
 
 def _filter_raw_by_machine(raw_payload: dict[str, Any], machine: str | None) -> dict[str, Any]:
@@ -987,12 +1049,14 @@ def make_handler(state: HubState) -> type[BaseHTTPRequestHandler]:
                     return
                 machine_id = str(body.get("machine_id") or body.get("machine") or "")
                 raw_payload = body.get("payload") if isinstance(body.get("payload"), dict) else body
+                raw_payload = redact.redact_obj(raw_payload)
                 try:
                     res = multi_machine.save_machine_raw(state.data_dir, machine_id, raw_payload)
                 except ValueError as exc:
                     self._send_json(400, {"error": str(exc)})
                     return
-                self._send_json(200, {"ok": True, **res})
+                queued = state.schedule_resummarize_for_workday(str(res.get("workday") or ""))
+                self._send_json(200, {"ok": True, "auto_resummarize_queued": queued, **res})
                 return
 
             if path == "/api/v1/ingest/summary":
@@ -1116,6 +1180,7 @@ def main() -> None:
         llm_api_key=os.environ.get("LLM_API_KEY", ""),
         llm_model=os.environ.get("LLM_MODEL", "gpt-4o-mini"),
         allow_fallback_summarize=os.environ.get("ALLOW_FALLBACK_SUMMARIZE", "false").lower() in ("1", "true", "yes"),
+        push_resummarize_debounce_sec=float(os.environ.get("SUMMARIZE_PUSH_DEBOUNCE_SEC", "120")),
     )
     state.start_scheduler()
     try:
