@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Import a week of local AI sessions and show the first project query."""
 
+from __future__ import annotations
+
 import argparse
 from collections.abc import Iterable
 from contextlib import closing

@@ -150,10 +150,12 @@ def merge_raw_payloads(workday: str, machine_payloads: dict[str, dict[str, Any]]
         "workbuddy": [],
         "git": [],
         "files": [],
+        "live_notes": [],
     }
     seen_bucket_keys: dict[str, set[str]] = {k: set() for k in buckets}
 
     spans: list[str] = []
+    uploaded_times: list[str] = []
     overall_hours = 0.0
     ag_hours = 0.0
     cx_hours = 0.0
@@ -162,6 +164,8 @@ def merge_raw_payloads(workday: str, machine_payloads: dict[str, dict[str, Any]]
 
     for mid in machines:
         p = machine_payloads[mid] or {}
+        if p.get("uploaded_at"):
+            uploaded_times.append(str(p["uploaded_at"]))
         if not weekday and p.get("weekday"):
             weekday = str(p["weekday"])
         if not window_local and p.get("window_local"):
@@ -216,10 +220,22 @@ def merge_raw_payloads(workday: str, machine_payloads: dict[str, dict[str, Any]]
             seen_bucket_keys["files"].add(dedup)
             buckets["files"].append(item)
 
+        for it in p.get("live_notes") or []:
+            if not isinstance(it, dict):
+                continue
+            item = dict(it)
+            item["machine"] = str(item.get("machine") or mid)
+            dedup = f"{item.get('time') or ''}::{item.get('project') or ''}::{item.get('text') or ''}"
+            if not item.get("text") or dedup in seen_bucket_keys["live_notes"]:
+                continue
+            seen_bucket_keys["live_notes"].add(dedup)
+            buckets["live_notes"].append(item)
+
     for key in ("antigravity", "codex", "claude", "workbuddy"):
         buckets[key].sort(key=lambda x: (str(x.get("active_span") or ""), str(x.get("machine") or "")))
+    buckets["live_notes"].sort(key=lambda x: (str(x.get("created_at") or ""), str(x.get("time") or "")))
 
-    return {
+    merged_out: dict[str, Any] = {
         "workday": workday,
         "weekday": weekday,
         "window_local": window_local,
@@ -238,6 +254,7 @@ def merge_raw_payloads(workday: str, machine_payloads: dict[str, dict[str, Any]]
             "workbuddy_sessions": len(buckets["workbuddy"]),
             "git_repos": len(buckets["git"]),
             "file_groups": len(buckets["files"]),
+            "live_notes": len(buckets["live_notes"]),
         },
         "antigravity": buckets["antigravity"],
         "codex": buckets["codex"],
@@ -245,7 +262,11 @@ def merge_raw_payloads(workday: str, machine_payloads: dict[str, dict[str, Any]]
         "workbuddy": buckets["workbuddy"],
         "git": buckets["git"],
         "files": buckets["files"],
+        "live_notes": buckets["live_notes"],
     }
+    if uploaded_times:
+        merged_out["latest_uploaded_at"] = max(uploaded_times)
+    return merged_out
 
 
 def merge_summary_payloads(workday: str, machine_summaries: dict[str, dict[str, Any]]) -> dict[str, Any]:
@@ -393,7 +414,7 @@ def save_machine_raw(data_dir: str, machine_id: str, raw_payload: dict[str, Any]
     stamped = dict(raw_payload)
     stamped["machine"] = mid
     stamped["uploaded_at"] = datetime.now(timezone.utc).isoformat()
-    for key in ("antigravity", "codex", "workbuddy", "git", "files"):
+    for key in ("antigravity", "codex", "claude", "workbuddy", "git", "files", "live_notes"):
         if isinstance(stamped.get(key), list):
             stamped[key] = tag_items_with_machine(stamped[key], mid)
 
@@ -411,7 +432,7 @@ def save_machine_raw(data_dir: str, machine_id: str, raw_payload: dict[str, Any]
             with open(fp, "r", encoding="utf-8") as fh:
                 by_machine[shard_mid] = json.load(fh)
 
-        # Preserve any legacy pre-migration raw file that had no machine shard yet
+        # Persist any legacy pre-migration raw file as a dedicated machine shard so later uploads never drop it
         merged_path = _merged_raw_path(data_dir, workday)
         if os.path.exists(merged_path):
             try:
@@ -420,7 +441,13 @@ def save_machine_raw(data_dir: str, machine_id: str, raw_payload: dict[str, Any]
                 if isinstance(existing, dict) and not existing.get("machines"):
                     legacy_mid = normalize_machine_id(existing.get("machine") or "legacy")
                     if legacy_mid not in by_machine and legacy_mid != mid:
-                        by_machine[legacy_mid] = existing
+                        legacy_stamped = dict(existing)
+                        legacy_stamped["machine"] = legacy_mid
+                        for key in ("antigravity", "codex", "claude", "workbuddy", "git", "files", "live_notes"):
+                            if isinstance(legacy_stamped.get(key), list):
+                                legacy_stamped[key] = tag_items_with_machine(legacy_stamped[key], legacy_mid)
+                        atomic_write_json(_machine_raw_path(data_dir, legacy_mid, workday), legacy_stamped)
+                        by_machine[legacy_mid] = legacy_stamped
             except Exception:
                 pass
 
@@ -650,6 +677,44 @@ def load_merged_live_days(
         day = load_merged_live_day(data_dir, wd)
         if day.get("notes") or day.get("sessions") or day.get("git"):
             results.append(day)
+        if len(results) >= max_days:
+            break
+    return results
+
+
+def load_archived_live_note_days(
+    data_dir: str,
+    archived_workdays: set[str] | None = None,
+    max_days: int = 365,
+) -> list[dict[str, Any]]:
+    """Return note-only live day records for archived workdays so --note entries remain searchable after compaction."""
+    archived = archived_workdays or set()
+    if not archived:
+        return []
+    workdays: set[str] = set()
+    for pat in (
+        os.path.join(data_dir, "live", "live_*.json"),
+        os.path.join(data_dir, "live", "machines", "*", "live_*.json"),
+    ):
+        for fp in glob.glob(pat):
+            m = re.match(r"^live_(\d{4}-\d{2}-\d{2})\.json$", os.path.basename(fp))
+            if m and m.group(1) in archived:
+                workdays.add(m.group(1))
+    results: list[dict[str, Any]] = []
+    for wd in sorted(workdays, reverse=True):
+        day = load_merged_live_day(data_dir, wd)
+        notes = list(day.get("notes") or [])
+        if notes:
+            results.append(
+                {
+                    "workday": wd,
+                    "updated_at": day.get("updated_at") or "",
+                    "machines": day.get("machines") or [],
+                    "notes": notes,
+                    "sessions": [],
+                    "git": [],
+                }
+            )
         if len(results) >= max_days:
             break
     return results

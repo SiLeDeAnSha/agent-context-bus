@@ -364,7 +364,10 @@ def rebuild_structured_index(
     if catalog is None:
         catalog = ProjectCatalog(days, load_registry(data_dir))
     archived = {str(d.get("workday") or "") for d in days}
-    live_days = multi_machine.load_merged_live_days(data_dir, archived_workdays=archived, max_days=2)
+    live_days = [
+        *multi_machine.load_merged_live_days(data_dir, archived_workdays=archived, max_days=2),
+        *multi_machine.load_archived_live_note_days(data_dir, archived_workdays=archived),
+    ]
     dec_store = dec_mod.load_decisions_store(data_dir)
 
     rows: list[tuple[Any, ...]] = []

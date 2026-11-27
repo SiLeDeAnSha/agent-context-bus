@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Prepare gsheets batch JSON files from Work and Personal Excel workbooks."""
 
+from __future__ import annotations
+
 import json
 import os
 from typing import Any

@@ -684,7 +684,10 @@ def query_project_timeline(
 
     projects = sorted(matched_projects.values(), key=lambda p: p["project"])
     archived = {str(d.get("workday", "")) for d in days}
-    uncompacted = multi_machine.load_merged_live_days(data_dir, archived_workdays=archived)
+    uncompacted = [
+        *multi_machine.load_merged_live_days(data_dir, archived_workdays=archived),
+        *multi_machine.load_archived_live_note_days(data_dir, archived_workdays=archived),
+    ]
     live_hits: list[dict[str, Any]] = []
     if uncompacted:
         if len(projects) == 1:
@@ -911,7 +914,10 @@ def query_keyword(
 
     sliced = hits[:limit]
     raw_hits = raw_for_results(sliced, data_dir, machine_filter) if include_raw else []
-    uncompacted = multi_machine.load_merged_live_days(data_dir, archived_workdays=archived)
+    uncompacted = [
+        *multi_machine.load_merged_live_days(data_dir, archived_workdays=archived),
+        *multi_machine.load_archived_live_note_days(data_dir, archived_workdays=archived),
+    ]
     live_hits = (
         live_memory.search_live_entries(uncompacted, terms=terms)
         if uncompacted and not status_filter and not machine_filter

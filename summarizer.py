@@ -99,7 +99,8 @@ SYSTEM_PROMPT = """你是一个跨设备、跨端（Antigravity / Codex / Claude
    commit 的 id 必须逐字取自对应仓库 commits 中的 hash，file 的 id 必须逐字取自文件组的 paths。
    仅引用能明确支持本条内容的记录；不能确认时用空数组。同名项目、同日或同工作目录本身不足以证明关联。
    工作目录和 Git 改动文件由程序从原始记录补全，无需提供。
-6. candidate_decisions 宁缺毋滥（每天最多 5 条），仅记录真正有长期复用价值的硬约束、避坑结论或架构选型。"""
+6. candidate_decisions 宁缺毋滥（每天最多 5 条），仅记录真正有长期复用价值的硬约束、避坑结论或架构选型。
+7. 若输入包含 live_notes（用户当日主动记录的关键笔记），务必将其关键结论与路径融入对应项目的 work_items，不可遗漏。"""
 
 
 def _compact_raw_for_llm(raw_payload: dict[str, Any], existing_projects: list[dict[str, Any]]) -> dict[str, Any]:
@@ -139,6 +140,7 @@ def _compact_raw_for_llm(raw_payload: dict[str, Any], existing_projects: list[di
         "workbuddy": trim_sessions(raw_payload.get("workbuddy") or []),
         "git": (raw_payload.get("git") or [])[:30],
         "files": (raw_payload.get("files") or [])[:30],
+        "live_notes": (raw_payload.get("live_notes") or [])[:40],
     })
 
 
@@ -417,6 +419,34 @@ def fallback_rule_summarize(
             entry["machine"] = str(g["machine"])
         work_items.append(entry)
 
+    for note in raw_payload.get("live_notes") or []:
+        if not isinstance(note, dict):
+            continue
+        txt = str(note.get("text") or "").strip()
+        if not txt:
+            continue
+        proj = str(note.get("project") or "未分类项目").strip()
+        paths = [str(p) for p in (note.get("paths") or []) if p]
+        entry = {
+            "project": proj,
+            "category": "实时笔记",
+            "tool": "Note",
+            "session_name": f"实时笔记 {note.get('time') or ''}".strip(),
+            "summary": txt[:180],
+            "outputs": "；".join(paths) if paths else "-",
+            "sources": [],
+            "active_span": str(note.get("time") or "-"),
+            "estimated_hours": 0.0,
+            "status": "阶段完成",
+            "next_step": "-",
+            "scope": "personal",
+        }
+        if note.get("project_id"):
+            entry["project_id"] = str(note["project_id"])
+        if note.get("machine"):
+            entry["machine"] = str(note["machine"])
+        work_items.append(entry)
+
     projects = sorted({it["project"] for it in work_items})
     headline = "、".join(projects[:4]) if projects else f"{raw_payload.get('workday', '')} 无新增项目活动"
     return normalize_summary_schema(
@@ -516,6 +546,29 @@ def summarize_workday(
     if not raw_payload:
         raise FileNotFoundError(f"No merged raw file found for workday {workday} under {data_dir}")
 
+    # Merge any live notes recorded directly on the hub/local live WAL for this workday
+    try:
+        live_day = multi_machine.load_merged_live_day(data_dir, workday)
+        live_notes = list(live_day.get("notes") or [])
+        if live_notes:
+            merged_notes = list(raw_payload.get("live_notes") or [])
+            seen = {
+                (str(n.get("time") or ""), str(n.get("project") or ""), str(n.get("text") or ""))
+                for n in merged_notes
+                if isinstance(n, dict)
+            }
+            for n in live_notes:
+                if not isinstance(n, dict):
+                    continue
+                key = (str(n.get("time") or ""), str(n.get("project") or ""), str(n.get("text") or ""))
+                if key[2] and key not in seen:
+                    seen.add(key)
+                    merged_notes.append(n)
+            if len(merged_notes) != len(raw_payload.get("live_notes") or []):
+                raw_payload = {**raw_payload, "live_notes": merged_notes}
+    except Exception:
+        pass
+
     base_url = (llm_base_url or os.environ.get("LLM_BASE_URL") or "").strip()
     api_key = (llm_api_key or os.environ.get("LLM_API_KEY") or "").strip()
     model = (llm_model or os.environ.get("LLM_MODEL") or "gpt-4o-mini").strip()
@@ -535,16 +588,54 @@ def summarize_workday(
     raise RuntimeError("LLM_BASE_URL / LLM_API_KEY not configured (pass allow_fallback=True for rule-based fallback).")
 
 
+def _summary_covered_machines(day_obj: dict[str, Any]) -> set[str]:
+    covered: set[str] = set()
+    for m in day_obj.get("machines") or []:
+        if m and str(m) not in ("__nas__", "__merged__"):
+            covered.add(multi_machine.normalize_machine_id(str(m)))
+    for bucket in ("work_items", "life_items"):
+        for it in day_obj.get(bucket) or []:
+            if isinstance(it, dict) and it.get("machine"):
+                covered.add(multi_machine.normalize_machine_id(str(it["machine"])))
+    return covered
+
+
 def find_unsummarized_raw_days(data_dir: str, lookback_days: int = 14, tz_name: str = "Asia/Shanghai", day_start_hour: int = 5) -> list[str]:
-    """Find completed workdays that have raw traces but are not yet in summary_all_history.json."""
+    """Find completed workdays that lack a summary OR received late raw shards from additional/updated machines."""
     tz = ZoneInfo(tz_name)
     logical_today = (datetime.now(tz) - timedelta(hours=day_start_hour)).date()
     yesterday = (logical_today - timedelta(days=1)).strftime("%Y-%m-%d")
     cutoff = (logical_today - timedelta(days=max(1, lookback_days))).strftime("%Y-%m-%d")
 
     raw_days = set(multi_machine.list_raw_workdays(data_dir))
-    summarized = {str(d.get("workday")) for d in query_memory.load_all_days(data_dir) if d.get("workday")}
-    return sorted(wd for wd in raw_days if cutoff <= wd <= yesterday and wd not in summarized)
+    day_by_wd = {
+        str(d.get("workday")): d
+        for d in query_memory.load_all_days(data_dir)
+        if isinstance(d, dict) and d.get("workday")
+    }
+    pending: list[str] = []
+    for wd in sorted(raw_days):
+        if not (cutoff <= wd <= yesterday):
+            continue
+        day_obj = day_by_wd.get(wd)
+        if day_obj is None:
+            pending.append(wd)
+            continue
+        raw_payload = query_memory.load_raw_day(wd, data_dir=data_dir) or {}
+        raw_machines = {
+            multi_machine.normalize_machine_id(str(m))
+            for m in (raw_payload.get("machines") or ([raw_payload["machine"]] if raw_payload.get("machine") else []))
+            if m and str(m) not in ("__nas__", "__merged__")
+        }
+        sum_machines = _summary_covered_machines(day_obj)
+        if raw_machines and (raw_machines - sum_machines):
+            pending.append(wd)
+            continue
+        latest_upload = str(raw_payload.get("latest_uploaded_at") or raw_payload.get("uploaded_at") or "")
+        sum_updated = str(day_obj.get("updated_at") or "")
+        if latest_upload and sum_updated and latest_upload > sum_updated:
+            pending.append(wd)
+    return pending
 
 
 def main() -> None:

@@ -467,6 +467,94 @@ class V05UpgradeTests(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
 
+    def test_p1_audit_fixes_legacy_merge_late_device_live_notes_and_export_sanitize(self) -> None:
+        import export_report
+        import summarizer
+
+        with tempfile.TemporaryDirectory() as tmp:
+            wd = "2026-11-20"
+            # 1. Pre-migration legacy raw file survives both 1st (Mac) and 2nd (Windows) machine uploads
+            legacy_path = os.path.join(tmp, "raw", wd[:7], f"raw_{wd}.json")
+            multi_machine.atomic_write_json(
+                legacy_path,
+                {
+                    "workday": wd,
+                    "weekday": "周五",
+                    "antigravity": [{"id": "leg-1", "title": "Legacy Task", "active_span": "09:00-10:00"}],
+                    "codex": [],
+                    "git": [],
+                    "files": [],
+                },
+            )
+            multi_machine.save_machine_raw(
+                tmp,
+                "mac-pro",
+                {
+                    "workday": wd,
+                    "weekday": "周五",
+                    "antigravity": [{"id": "mac-1", "title": "Mac Task", "active_span": "10:00-11:00"}],
+                    "codex": [],
+                    "git": [],
+                    "files": [],
+                    "live_notes": [{"time": "10:30", "project": "日迹", "text": "关键实时笔记：跨机合并不丢"}],
+                },
+            )
+            # First upload generates summary covering legacy + mac-pro
+            first_sum = summarizer.summarize_workday(wd, tmp, allow_fallback=True)
+            first_sum["updated_at"] = "2026-11-21T01:00:00+00:00"
+            multi_machine.atomic_write_json(os.path.join(tmp, "summary_all_history.json"), {"days": [first_sum]})
+
+            # Verify live_notes carried into merged raw, LLM input, and fallback summary
+            merged_1 = query_memory.load_raw_day(wd, data_dir=tmp)
+            self.assertEqual(len(merged_1.get("live_notes") or []), 1)
+            llm_in = summarizer._compact_raw_for_llm(merged_1, [])
+            self.assertEqual(len(llm_in.get("live_notes") or []), 1)
+            self.assertTrue(any("跨机合并不丢" in str(it.get("summary")) for it in first_sum.get("work_items") or []))
+
+            # 2. Second upload from late Windows machine must keep legacy + mac + windows AND trigger find_unsummarized_raw_days
+            multi_machine.save_machine_raw(
+                tmp,
+                "win-desktop",
+                {
+                    "workday": wd,
+                    "weekday": "周五",
+                    "codex": [{"id": "win-1", "title": "Win Late Task", "active_span": "21:00-22:00"}],
+                    "antigravity": [],
+                    "git": [],
+                    "files": [],
+                },
+            )
+            merged_2 = query_memory.load_raw_day(wd, data_dir=tmp)
+            self.assertEqual(sorted(merged_2["machines"]), ["legacy", "mac-pro", "win-desktop"])
+            ag_ids = {s["id"] for s in merged_2["antigravity"]}
+            self.assertEqual(ag_ids, {"leg-1", "mac-1"})
+            cx_ids = {s["id"] for s in merged_2["codex"]}
+            self.assertEqual(cx_ids, {"win-1"})
+
+            pending = summarizer.find_unsummarized_raw_days(tmp, lookback_days=30)
+            self.assertIn(wd, pending)
+
+            # 3. Archived day's live --note stays searchable via both exact and FTS5 regular queries
+            live_memory.add_note(tmp, [first_sum], "日迹", "归档后仍应搜到这条独特暗号_NOTE9981", workday=wd)
+            res_exact = query_memory.query_by_keyword([first_sum], "NOTE9981", data_dir=tmp, use_fts=False)
+            self.assertTrue(any("NOTE9981" in str(x.get("text")) for x in res_exact.get("live") or []))
+            res_fts = query_memory.query_by_keyword([first_sum], "NOTE9981", data_dir=tmp, use_fts=True)
+            self.assertTrue(any("NOTE9981" in str(x.get("text")) for x in res_fts.get("live") or []))
+
+        # 4. External report sanitization strips Windows paths & macOS paths containing spaces
+        s1 = export_report.sanitize_text(r"完成了 C:\Users\Alice\My Documents\Work Report\demo.docx 的排版")
+        self.assertNotIn("Users", s1)
+        self.assertNotIn("demo.docx", s1)
+        self.assertIn("完成了", s1)
+        self.assertIn("的排版", s1)
+
+        s2 = export_report.sanitize_text("导出了 /Users/xiangqirui/Library/Application Support/My App/output final.pdf 和汇报")
+        self.assertNotIn("/Users/", s2)
+        self.assertNotIn("Application Support", s2)
+        self.assertNotIn("output final.pdf", s2)
+        self.assertIn("导出了", s2)
+        self.assertIn("和汇报", s2)
+
 
 if __name__ == "__main__":
     unittest.main()

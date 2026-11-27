@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Export a sanitized, external-safe Markdown daily or weekly work report from Excel."""
 
+from __future__ import annotations
+
 import argparse
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -10,7 +12,12 @@ import re
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from openpyxl import load_workbook
+try:
+    from openpyxl import load_workbook
+except ImportError:
+    load_workbook = None  # type: ignore[assignment]
+
+import redact
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
@@ -27,12 +34,23 @@ def load_config() -> dict[str, Any]:
     return cfg
 
 
+_PATH_STOP = r"\r\n,，。；;）)\"'\`<>|：:"
+_WIN_PATH_RE = re.compile(
+    rf"(?<![A-Za-z0-9_])[A-Za-z]:[\\/][^{_PATH_STOP}]+?(?=(?:[{_PATH_STOP}]|$|\s+(?=[\u4e00-\u9fff]|[-–—]|(?:and|or|to|with|for|in|on|at|from|via|by)\b)))",
+    re.IGNORECASE,
+)
+_POSIX_USER_PATH_RE = re.compile(
+    rf"(?:(?:/(?:Users|home)/)|(?:~/))[^{_PATH_STOP}]+?(?=(?:[{_PATH_STOP}]|$|\s+(?=[\u4e00-\u9fff]|[-–—]|(?:and|or|to|with|for|in|on|at|from|via|by)\b)))"
+)
+
+
 def sanitize_text(text: str) -> str:
     if not text:
         return ""
-    s = str(text)
-    # Strip absolute local user paths and internal sidebar folder tags.
-    s = re.sub(r"/Users/[^\s,，。；;）)]+", "", s)
+    s = redact.redact_text(str(text))
+    # Strip Windows drive paths (including spaces inside segments) and macOS/Linux user paths.
+    s = _WIN_PATH_RE.sub("", s)
+    s = _POSIX_USER_PATH_RE.sub("", s)
     s = re.sub(r"\[(?:📁|目录:)[^\]]+\]", "", s)
     s = re.sub(r"\s{2,}", " ", s).strip(" ，、；;")
     return s
